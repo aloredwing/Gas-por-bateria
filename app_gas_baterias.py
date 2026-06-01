@@ -2,56 +2,175 @@ import io
 import re
 import numpy as np
 import pandas as pd
+import altair as alt
 import streamlit as st
 
 
 st.set_page_config(
-    page_title="Análisis de Gas por Baterías",
+    page_title="Gas por Baterías Lote X",
     page_icon="⛽",
     layout="wide"
 )
 
 
 # ============================================================
-# FUNCIONES
+# CONFIGURACIÓN VISUAL
 # ============================================================
 
-def limpiar_nombre_columna(col):
-    return str(col).strip()
+MESES_ES = {
+    1: "Ene",
+    2: "Feb",
+    3: "Mar",
+    4: "Abr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Ago",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dic"
+}
+
+
+# ============================================================
+# FUNCIONES DE CARGA Y LIMPIEZA
+# ============================================================
+
+def normalizar_columna(columna):
+    texto = str(columna).strip()
+    texto = re.sub(r"\s+", " ", texto)
+    return texto
+
+
+def detectar_hoja(xls):
+    """
+    Prioriza una hoja con nombre típico de tabla de gas.
+    Si no existe, usa la primera hoja.
+    """
+    posibles = [
+        "tbl_produccion_gas_baterias",
+        "produccion_gas_baterias",
+        "gas por baterias",
+        "gas por baterías",
+        "gas"
+    ]
+
+    for hoja in xls.sheet_names:
+        hoja_norm = hoja.strip().lower()
+        if hoja_norm in posibles:
+            return hoja
+
+    return xls.sheet_names[0]
+
+
+def detectar_columna_fecha(df):
+    """
+    Detecta la columna de fecha. Primero busca nombres típicos.
+    Si no los encuentra, prueba cuál columna puede convertirse mejor a fecha.
+    """
+    nombres_fecha = ["Fecha", "FECHA", "fecha", "Date", "DATE", "date"]
+
+    for col in df.columns:
+        if str(col).strip() in nombres_fecha:
+            return col
+
+    mejor_col = None
+    mejor_ratio = 0
+
+    for col in df.columns:
+        serie = pd.to_datetime(df[col], errors="coerce")
+        ratio = serie.notna().mean()
+        if ratio > mejor_ratio:
+            mejor_ratio = ratio
+            mejor_col = col
+
+    if mejor_col is not None and mejor_ratio >= 0.60:
+        return mejor_col
+
+    raise ValueError("No pude detectar la columna de fecha. La hoja debe tener una columna llamada Fecha.")
 
 
 def cargar_excel_gas(uploaded_file):
+    """
+    Carga el Excel en formato ancho:
+    Fecha | batería 1 | batería 2 | batería 3 | ...
+    """
     xls = pd.ExcelFile(uploaded_file)
-    hoja = xls.sheet_names[0]
-
-    # Si existe esta hoja, usarla directamente.
-    for h in xls.sheet_names:
-        if h.strip().lower() == "tbl_produccion_gas_baterias":
-            hoja = h
-            break
+    hoja = detectar_hoja(xls)
 
     df = pd.read_excel(xls, sheet_name=hoja)
-    df.columns = [limpiar_nombre_columna(c) for c in df.columns]
+    df.columns = [normalizar_columna(c) for c in df.columns]
 
-    if "Fecha" not in df.columns:
-        raise ValueError("No encontré la columna 'Fecha'. Revisa que el Excel tenga una columna llamada Fecha.")
-
+    col_fecha = detectar_columna_fecha(df)
+    df = df.rename(columns={col_fecha: "Fecha"})
     df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
 
-    columnas_excluir = ["Fecha", "Comentarios", "ID"]
-    baterias = [c for c in df.columns if c not in columnas_excluir]
+    columnas_excluir_clave = [
+        "fecha",
+        "comentario",
+        "comentarios",
+        "observacion",
+        "observación",
+        "observaciones",
+        "id",
+        "total",
+        "lote",
+        "campo"
+    ]
 
-    for c in baterias:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    baterias = []
 
-    # Limpieza de filas inválidas o vacías.
+    for col in df.columns:
+        col_norm = str(col).strip().lower()
+
+        if any(palabra in col_norm for palabra in columnas_excluir_clave):
+            continue
+
+        serie_num = pd.to_numeric(df[col], errors="coerce")
+
+        if serie_num.notna().sum() > 0:
+            df[col] = serie_num
+            baterias.append(col)
+
+    if not baterias:
+        raise ValueError("No encontré columnas numéricas de baterías. Revisa que las baterías estén como columnas con valores de gas.")
+
     df = df[df["Fecha"].notna()].copy()
-    df = df[df["Fecha"].dt.year >= 2020].copy()
     df = df[df[baterias].notna().any(axis=1)].copy()
     df = df.sort_values("Fecha").reset_index(drop=True)
 
     return df, baterias, hoja
 
+
+def crear_total_lote(df, baterias):
+    salida = df.copy()
+    salida["TOTAL_GAS_LOTE"] = salida[baterias].sum(axis=1, skipna=True)
+    return salida
+
+
+def convertir_a_formato_largo(df, baterias):
+    largo = df.melt(
+        id_vars=["Fecha"],
+        value_vars=baterias,
+        var_name="BATERIA",
+        value_name="GAS"
+    )
+
+    largo["GAS"] = pd.to_numeric(largo["GAS"], errors="coerce")
+    largo = largo[largo["GAS"].notna()].copy()
+    largo["AÑO"] = largo["Fecha"].dt.year
+    largo["MES"] = largo["Fecha"].dt.month
+    largo["MES_TXT"] = largo["MES"].map(MESES_ES)
+    largo["MES_LABEL"] = largo["MES"].astype(str).str.zfill(2) + " " + largo["MES_TXT"]
+    largo["PERIODO_MES"] = largo["Fecha"].dt.to_period("M").dt.to_timestamp()
+
+    return largo
+
+
+# ============================================================
+# FUNCIONES DE CÁLCULO
+# ============================================================
 
 def promedio_periodo(df, baterias, fecha_ini, fecha_fin):
     mask = (df["Fecha"] >= pd.to_datetime(fecha_ini)) & (df["Fecha"] <= pd.to_datetime(fecha_fin))
@@ -69,6 +188,13 @@ def dias_validos_periodo(df, baterias, fecha_ini, fecha_fin):
 
 
 def crear_resumen_criticidad(df, baterias, fecha_corte, ventana_dias):
+    """
+    Criterio de criticidad:
+    45 por ciento caída de periodo actual contra periodo previo
+    25 por ciento caída últimos 7 días contra 7 días previos
+    20 por ciento caída contra mismo periodo del año anterior
+    10 por ciento último día contra promedio del periodo actual
+    """
     fecha_corte = pd.to_datetime(fecha_corte)
 
     actual_ini = fecha_corte - pd.Timedelta(days=ventana_dias - 1)
@@ -97,11 +223,12 @@ def crear_resumen_criticidad(df, baterias, fecha_corte, ventana_dias):
     ult_7_prom = promedio_periodo(df, baterias, ult_7_ini, actual_fin)
     prev_7_prom = promedio_periodo(df, baterias, prev_7_ini, prev_7_fin)
 
-    ultimo_dia = df[df["Fecha"] == fecha_corte][baterias]
-    if ultimo_dia.empty:
+    ultimo_dia_df = df[df["Fecha"] == fecha_corte][baterias]
+
+    if ultimo_dia_df.empty:
         ultimo = pd.Series(index=baterias, dtype=float)
     else:
-        ultimo = ultimo_dia.iloc[-1]
+        ultimo = ultimo_dia_df.iloc[-1]
 
     resumen = pd.DataFrame({
         "BATERIA": baterias,
@@ -118,60 +245,57 @@ def crear_resumen_criticidad(df, baterias, fecha_corte, ventana_dias):
     })
 
     resumen["CAIDA_ABS"] = resumen["PROM_ACTUAL"] - resumen["PROM_PREVIO"]
-    resumen["CAIDA_%"] = np.where(
+    resumen["CAIDA_PCT"] = np.where(
         resumen["PROM_PREVIO"] > 0,
         resumen["CAIDA_ABS"] / resumen["PROM_PREVIO"] * 100,
         np.nan
     )
 
     resumen["CAIDA_ABS_7D"] = resumen["PROM_ULT_7D"] - resumen["PROM_7D_PREVIO"]
-    resumen["CAIDA_%_7D"] = np.where(
+    resumen["CAIDA_PCT_7D"] = np.where(
         resumen["PROM_7D_PREVIO"] > 0,
         resumen["CAIDA_ABS_7D"] / resumen["PROM_7D_PREVIO"] * 100,
         np.nan
     )
 
     resumen["CAIDA_ABS_YOY"] = resumen["PROM_ACTUAL"] - resumen["PROM_MISMO_PERIODO_AÑO_ANT"]
-    resumen["CAIDA_%_YOY"] = np.where(
+    resumen["CAIDA_PCT_YOY"] = np.where(
         resumen["PROM_MISMO_PERIODO_AÑO_ANT"] > 0,
         resumen["CAIDA_ABS_YOY"] / resumen["PROM_MISMO_PERIODO_AÑO_ANT"] * 100,
         np.nan
     )
 
     resumen["VAR_ULTIMO_VS_PROM"] = resumen["ULTIMO_DIA"] - resumen["PROM_ACTUAL"]
-    resumen["VAR_%_ULTIMO_VS_PROM"] = np.where(
+    resumen["VAR_PCT_ULTIMO_VS_PROM"] = np.where(
         resumen["PROM_ACTUAL"] > 0,
         resumen["VAR_ULTIMO_VS_PROM"] / resumen["PROM_ACTUAL"] * 100,
         np.nan
     )
 
-    # Score de criticidad:
-    # Más peso a caída del periodo actual vs periodo previo.
-    # También considera caída semanal, caída interanual y último día debajo del promedio.
     resumen["SCORE_CRITICIDAD"] = (
-        (-resumen["CAIDA_%"].clip(upper=0).fillna(0)) * 0.45 +
-        (-resumen["CAIDA_%_7D"].clip(upper=0).fillna(0)) * 0.25 +
-        (-resumen["CAIDA_%_YOY"].clip(upper=0).fillna(0)) * 0.20 +
-        (-resumen["VAR_%_ULTIMO_VS_PROM"].clip(upper=0).fillna(0)) * 0.10
+        (-resumen["CAIDA_PCT"].clip(upper=0).fillna(0)) * 0.45 +
+        (-resumen["CAIDA_PCT_7D"].clip(upper=0).fillna(0)) * 0.25 +
+        (-resumen["CAIDA_PCT_YOY"].clip(upper=0).fillna(0)) * 0.20 +
+        (-resumen["VAR_PCT_ULTIMO_VS_PROM"].clip(upper=0).fillna(0)) * 0.10
     )
 
     def nivel(row):
-        if row["CAIDA_%"] <= -20 and row["CAIDA_%_7D"] <= -10:
-            return "CRÍTICO"
-        if row["CAIDA_%"] <= -12:
+        if row["CAIDA_PCT"] <= -20 and row["CAIDA_PCT_7D"] <= -10:
+            return "CRITICO"
+        if row["CAIDA_PCT"] <= -12:
             return "ALTO"
-        if row["CAIDA_%_7D"] <= -20:
+        if row["CAIDA_PCT_7D"] <= -20:
             return "ALTO"
-        if row["CAIDA_%"] <= -5:
+        if row["CAIDA_PCT"] <= -5:
             return "MEDIO"
-        if row["CAIDA_%_7D"] <= -10:
+        if row["CAIDA_PCT_7D"] <= -10:
             return "MEDIO"
         return "NORMAL"
 
     resumen["NIVEL"] = resumen.apply(nivel, axis=1)
 
     orden_nivel = {
-        "CRÍTICO": 1,
+        "CRITICO": 1,
         "ALTO": 2,
         "MEDIO": 3,
         "NORMAL": 4
@@ -198,22 +322,128 @@ def crear_resumen_criticidad(df, baterias, fecha_corte, ventana_dias):
     return resumen, periodos
 
 
+def calcular_mensual_bateria(largo, bateria, anio, metrica):
+    data = largo[(largo["BATERIA"] == bateria) & (largo["AÑO"] == anio)].copy()
+
+    if data.empty:
+        return pd.DataFrame()
+
+    mensual = (
+        data
+        .groupby(["AÑO", "MES", "MES_LABEL"], as_index=False)
+        .agg(
+            PROM_MENSUAL=("GAS", "mean"),
+            TOTAL_MENSUAL=("GAS", "sum"),
+            DIAS_CON_DATO=("GAS", "count")
+        )
+    )
+
+    mensual = mensual.sort_values("MES").reset_index(drop=True)
+    mensual["VALOR_GRAFICA"] = mensual["PROM_MENSUAL"] if metrica == "Promedio diario mensual" else mensual["TOTAL_MENSUAL"]
+    mensual["MES_PREVIO_VALOR"] = mensual["VALOR_GRAFICA"].shift(1)
+    mensual["CAIDA_MENSUAL_ABS"] = mensual["VALOR_GRAFICA"] - mensual["MES_PREVIO_VALOR"]
+    mensual["CAIDA_MENSUAL_PCT"] = np.where(
+        mensual["MES_PREVIO_VALOR"] > 0,
+        mensual["CAIDA_MENSUAL_ABS"] / mensual["MES_PREVIO_VALOR"] * 100,
+        np.nan
+    )
+
+    mensual["ES_CAIDA"] = mensual["CAIDA_MENSUAL_ABS"] < 0
+
+    caidas = mensual[mensual["ES_CAIDA"]].copy()
+
+    if caidas.empty:
+        mensual["ALERTA_CAIDA"] = ""
+    else:
+        umbral_abs = caidas["CAIDA_MENSUAL_ABS"].quantile(0.25)
+        mensual["ALERTA_CAIDA"] = np.where(
+            (mensual["CAIDA_MENSUAL_PCT"] <= -10) | (mensual["CAIDA_MENSUAL_ABS"] <= umbral_abs),
+            "CAIDA FUERTE",
+            ""
+        )
+
+    mensual["CAIDA_LABEL"] = mensual["CAIDA_MENSUAL_PCT"].apply(
+        lambda x: "" if pd.isna(x) else f"{x:.1f}%"
+    )
+
+    return mensual
+
+
+def calcular_mensual_lote(df_total, anio):
+    data = df_total[df_total["Fecha"].dt.year == anio].copy()
+
+    if data.empty:
+        return pd.DataFrame()
+
+    data["MES"] = data["Fecha"].dt.month
+    data["MES_TXT"] = data["MES"].map(MESES_ES)
+    data["MES_LABEL"] = data["MES"].astype(str).str.zfill(2) + " " + data["MES_TXT"]
+
+    mensual = (
+        data
+        .groupby(["MES", "MES_LABEL"], as_index=False)
+        .agg(
+            PROMEDIO_DIARIO_LOTE=("TOTAL_GAS_LOTE", "mean"),
+            TOTAL_MENSUAL_LOTE=("TOTAL_GAS_LOTE", "sum"),
+            DIAS_CON_DATO=("TOTAL_GAS_LOTE", "count")
+        )
+        .sort_values("MES")
+    )
+
+    mensual["PROMEDIO_PREVIO"] = mensual["PROMEDIO_DIARIO_LOTE"].shift(1)
+    mensual["VAR_MENSUAL_ABS"] = mensual["PROMEDIO_DIARIO_LOTE"] - mensual["PROMEDIO_PREVIO"]
+    mensual["VAR_MENSUAL_PCT"] = np.where(
+        mensual["PROMEDIO_PREVIO"] > 0,
+        mensual["VAR_MENSUAL_ABS"] / mensual["PROMEDIO_PREVIO"] * 100,
+        np.nan
+    )
+
+    return mensual
+
+
+def calcular_caidas_mensuales_global(largo, anio, metrica):
+    data = largo[largo["AÑO"] == anio].copy()
+
+    if data.empty:
+        return pd.DataFrame()
+
+    mensual = (
+        data
+        .groupby(["BATERIA", "AÑO", "MES", "MES_LABEL"], as_index=False)
+        .agg(
+            PROM_MENSUAL=("GAS", "mean"),
+            TOTAL_MENSUAL=("GAS", "sum"),
+            DIAS_CON_DATO=("GAS", "count")
+        )
+    )
+
+    mensual = mensual.sort_values(["BATERIA", "AÑO", "MES"])
+    mensual["VALOR"] = mensual["PROM_MENSUAL"] if metrica == "Promedio diario mensual" else mensual["TOTAL_MENSUAL"]
+    mensual["VALOR_PREVIO"] = mensual.groupby("BATERIA")["VALOR"].shift(1)
+    mensual["CAIDA_ABS_MES"] = mensual["VALOR"] - mensual["VALOR_PREVIO"]
+    mensual["CAIDA_PCT_MES"] = np.where(
+        mensual["VALOR_PREVIO"] > 0,
+        mensual["CAIDA_ABS_MES"] / mensual["VALOR_PREVIO"] * 100,
+        np.nan
+    )
+
+    caidas = mensual[mensual["CAIDA_ABS_MES"] < 0].copy()
+    caidas = caidas.sort_values(["CAIDA_PCT_MES", "CAIDA_ABS_MES"], ascending=[True, True])
+
+    return caidas
+
+
 def formatear_tabla(df):
     salida = df.copy()
 
-    columnas_redondear = [
-        "PROM_ACTUAL", "PROM_PREVIO", "PROM_MISMO_PERIODO_AÑO_ANT",
-        "SUM_ACTUAL", "SUM_PREVIO",
-        "PROM_ULT_7D", "PROM_7D_PREVIO", "ULTIMO_DIA",
-        "CAIDA_ABS", "CAIDA_%", "CAIDA_ABS_7D", "CAIDA_%_7D",
-        "CAIDA_ABS_YOY", "CAIDA_%_YOY",
-        "VAR_ULTIMO_VS_PROM", "VAR_%_ULTIMO_VS_PROM",
-        "SCORE_CRITICIDAD"
-    ]
+    for col in salida.columns:
+        if pd.api.types.is_datetime64_any_dtype(salida[col]):
+            salida[col] = salida[col].dt.strftime("%Y-%m-%d")
 
-    for c in columnas_redondear:
-        if c in salida.columns:
-            salida[c] = pd.to_numeric(salida[c], errors="coerce").round(2)
+    columnas_num = salida.select_dtypes(include=["number"]).columns
+
+    for col in columnas_num:
+        salida[col] = salida[col].round(2)
 
     return salida
 
@@ -223,29 +453,149 @@ def descargar_csv(df):
 
 
 # ============================================================
-# INTERFAZ
+# FUNCIONES DE GRÁFICOS
 # ============================================================
 
-st.title("⛽ Análisis de caída de gas por baterías")
-st.caption("Carga el Excel de gas por baterías y el sistema identifica las baterías con mayor caída y mayor criticidad.")
+def grafica_mensual_bateria(mensual, metrica):
+    titulo_y = "Promedio diario mensual" if metrica == "Promedio diario mensual" else "Total mensual"
 
-archivo = st.file_uploader("Sube el Excel: Gas por baterías Lote X.xlsx", type=["xlsx"])
+    base = alt.Chart(mensual).encode(
+        x=alt.X("MES_LABEL:N", sort=list(mensual["MES_LABEL"]), title="Mes"),
+        y=alt.Y("VALOR_GRAFICA:Q", title=titulo_y),
+        tooltip=[
+            alt.Tooltip("MES_LABEL:N", title="Mes"),
+            alt.Tooltip("VALOR_GRAFICA:Q", title=titulo_y, format=",.2f"),
+            alt.Tooltip("CAIDA_MENSUAL_ABS:Q", title="Variación vs mes previo", format=",.2f"),
+            alt.Tooltip("CAIDA_MENSUAL_PCT:Q", title="Variación %", format=",.2f"),
+            alt.Tooltip("DIAS_CON_DATO:Q", title="Días con dato")
+        ]
+    )
+
+    barras = base.mark_bar()
+
+    linea = base.mark_line(point=True).encode(
+        y=alt.Y("VALOR_GRAFICA:Q", title=titulo_y)
+    )
+
+    caidas = mensual[mensual["ALERTA_CAIDA"] == "CAIDA FUERTE"].copy()
+
+    puntos = alt.Chart(caidas).mark_point(
+        size=140,
+        filled=True
+    ).encode(
+        x=alt.X("MES_LABEL:N", sort=list(mensual["MES_LABEL"])),
+        y="VALOR_GRAFICA:Q",
+        tooltip=[
+            alt.Tooltip("MES_LABEL:N", title="Mes"),
+            alt.Tooltip("CAIDA_MENSUAL_ABS:Q", title="Caída", format=",.2f"),
+            alt.Tooltip("CAIDA_MENSUAL_PCT:Q", title="Caída %", format=",.2f")
+        ]
+    )
+
+    texto = alt.Chart(caidas).mark_text(
+        dy=-12,
+        fontSize=12
+    ).encode(
+        x=alt.X("MES_LABEL:N", sort=list(mensual["MES_LABEL"])),
+        y="VALOR_GRAFICA:Q",
+        text="CAIDA_LABEL:N"
+    )
+
+    return (barras + linea + puntos + texto).properties(height=420)
+
+
+def grafica_lote_mensual(mensual_lote):
+    base = alt.Chart(mensual_lote).encode(
+        x=alt.X("MES_LABEL:N", sort=list(mensual_lote["MES_LABEL"]), title="Mes"),
+        y=alt.Y("PROMEDIO_DIARIO_LOTE:Q", title="Promedio diario del lote"),
+        tooltip=[
+            alt.Tooltip("MES_LABEL:N", title="Mes"),
+            alt.Tooltip("PROMEDIO_DIARIO_LOTE:Q", title="Promedio diario", format=",.2f"),
+            alt.Tooltip("VAR_MENSUAL_ABS:Q", title="Variación vs mes previo", format=",.2f"),
+            alt.Tooltip("VAR_MENSUAL_PCT:Q", title="Variación %", format=",.2f")
+        ]
+    )
+
+    barras = base.mark_bar()
+    linea = base.mark_line(point=True)
+
+    caidas = mensual_lote[mensual_lote["VAR_MENSUAL_ABS"] < 0].copy()
+
+    if not caidas.empty:
+        umbral = caidas["VAR_MENSUAL_ABS"].quantile(0.25)
+        caidas_fuertes = caidas[
+            (caidas["VAR_MENSUAL_PCT"] <= -5) |
+            (caidas["VAR_MENSUAL_ABS"] <= umbral)
+        ].copy()
+    else:
+        caidas_fuertes = pd.DataFrame(columns=mensual_lote.columns)
+
+    puntos = alt.Chart(caidas_fuertes).mark_point(
+        size=140,
+        filled=True
+    ).encode(
+        x=alt.X("MES_LABEL:N", sort=list(mensual_lote["MES_LABEL"])),
+        y="PROMEDIO_DIARIO_LOTE:Q",
+        tooltip=[
+            alt.Tooltip("MES_LABEL:N", title="Mes"),
+            alt.Tooltip("VAR_MENSUAL_ABS:Q", title="Caída", format=",.2f"),
+            alt.Tooltip("VAR_MENSUAL_PCT:Q", title="Caída %", format=",.2f")
+        ]
+    )
+
+    caidas_fuertes["LABEL"] = caidas_fuertes["VAR_MENSUAL_PCT"].apply(
+        lambda x: "" if pd.isna(x) else f"{x:.1f}%"
+    )
+
+    texto = alt.Chart(caidas_fuertes).mark_text(
+        dy=-12,
+        fontSize=12
+    ).encode(
+        x=alt.X("MES_LABEL:N", sort=list(mensual_lote["MES_LABEL"])),
+        y="PROMEDIO_DIARIO_LOTE:Q",
+        text="LABEL:N"
+    )
+
+    return (barras + linea + puntos + texto).properties(height=420)
+
+
+# ============================================================
+# INTERFAZ PRINCIPAL
+# ============================================================
+
+st.title("⛽ Análisis de gas por baterías Lote X")
+st.caption("Sube el Excel y el sistema identificará las baterías más críticas, las caídas mensuales y el detalle por batería.")
+
+archivo = st.file_uploader("Sube el Excel de gas por baterías", type=["xlsx"])
 
 if archivo is None:
-    st.info("Sube el Excel para comenzar el análisis.")
+    st.info("Primero sube el Excel. Después se habilitarán los filtros de batería, año y periodo de análisis.")
     st.stop()
 
 try:
-    df, baterias, hoja = cargar_excel_gas(archivo)
+    df, baterias, hoja_usada = cargar_excel_gas(archivo)
 except Exception as e:
     st.error(f"No se pudo cargar el Excel: {e}")
     st.stop()
 
+df_total = crear_total_lote(df, baterias)
+largo = convertir_a_formato_largo(df, baterias)
+
 fecha_min = df["Fecha"].min().date()
 fecha_max = df["Fecha"].max().date()
+anios = sorted(largo["AÑO"].dropna().unique().astype(int).tolist())
+
+resumen_base, periodos_base = crear_resumen_criticidad(
+    df=df,
+    baterias=baterias,
+    fecha_corte=fecha_max,
+    ventana_dias=30
+)
+
+bateria_mas_critica = resumen_base.iloc[0]["BATERIA"] if not resumen_base.empty else baterias[0]
 
 with st.sidebar:
-    st.header("Filtros de análisis")
+    st.header("Filtros")
 
     fecha_corte = st.date_input(
         "Fecha de corte",
@@ -255,185 +605,332 @@ with st.sidebar:
     )
 
     ventana_dias = st.selectbox(
-        "Periodo actual a evaluar",
+        "Ventana para criticidad",
         [7, 15, 30, 60, 90, 180, 365],
         index=2,
         format_func=lambda x: f"Últimos {x} días"
     )
 
-    modo_baterias = st.radio(
-        "Baterías a mostrar",
-        ["Todas", "Solo críticas, altas y medias", "Solo críticas y altas"]
+    anio_sel = st.selectbox(
+        "Año para gráficas mensuales",
+        anios,
+        index=len(anios) - 1
     )
 
-resumen, periodos = crear_resumen_criticidad(df, baterias, fecha_corte, ventana_dias)
+    metrica_mensual = st.selectbox(
+        "Métrica mensual",
+        ["Promedio diario mensual", "Total mensual"],
+        index=0
+    )
 
-tabla = resumen.copy()
+    resumen_sidebar, _ = crear_resumen_criticidad(
+        df=df,
+        baterias=baterias,
+        fecha_corte=fecha_corte,
+        ventana_dias=ventana_dias
+    )
 
-if modo_baterias == "Solo críticas, altas y medias":
-    tabla = tabla[tabla["NIVEL"].isin(["CRÍTICO", "ALTO", "MEDIO"])]
-elif modo_baterias == "Solo críticas y altas":
-    tabla = tabla[tabla["NIVEL"].isin(["CRÍTICO", "ALTO"])]
+    lista_baterias_ordenadas = resumen_sidebar["BATERIA"].tolist()
+    indice_default = lista_baterias_ordenadas.index(bateria_mas_critica) if bateria_mas_critica in lista_baterias_ordenadas else 0
 
-# Total del lote
-df["TOTAL_GAS"] = df[baterias].sum(axis=1, skipna=True)
+    bateria_sel = st.selectbox(
+        "Batería para detalle",
+        lista_baterias_ordenadas,
+        index=indice_default
+    )
 
-mask_actual = (df["Fecha"] >= periodos["actual_ini"]) & (df["Fecha"] <= periodos["actual_fin"])
-mask_previo = (df["Fecha"] >= periodos["previo_ini"]) & (df["Fecha"] <= periodos["previo_fin"])
+resumen, periodos = crear_resumen_criticidad(
+    df=df,
+    baterias=baterias,
+    fecha_corte=fecha_corte,
+    ventana_dias=ventana_dias
+)
 
-prom_total_actual = df.loc[mask_actual, "TOTAL_GAS"].mean()
-prom_total_previo = df.loc[mask_previo, "TOTAL_GAS"].mean()
-caida_total_abs = prom_total_actual - prom_total_previo
-caida_total_pct = caida_total_abs / prom_total_previo * 100 if prom_total_previo > 0 else 0
+mensual_bateria = calcular_mensual_bateria(
+    largo=largo,
+    bateria=bateria_sel,
+    anio=anio_sel,
+    metrica=metrica_mensual
+)
 
-criticas = int((resumen["NIVEL"] == "CRÍTICO").sum())
-altas = int((resumen["NIVEL"] == "ALTO").sum())
-medias = int((resumen["NIVEL"] == "MEDIO").sum())
+mensual_lote = calcular_mensual_lote(df_total, anio_sel)
 
-st.subheader("Resumen del lote")
+caidas_globales = calcular_caidas_mensuales_global(
+    largo=largo,
+    anio=anio_sel,
+    metrica=metrica_mensual
+)
 
-c1, c2, c3, c4, c5 = st.columns(5)
+# ============================================================
+# PRIMERA VISTA
+# ============================================================
 
-with c1:
-    st.metric("Promedio actual total", f"{prom_total_actual:,.2f}")
+st.subheader("Primera lectura de criticidad")
 
-with c2:
-    st.metric("Promedio previo total", f"{prom_total_previo:,.2f}")
+peor = resumen.iloc[0]
 
-with c3:
-    st.metric("Caída total", f"{caida_total_abs:,.2f}", f"{caida_total_pct:,.2f}%")
+col1, col2, col3, col4, col5 = st.columns(5)
 
-with c4:
-    st.metric("Baterías críticas/altas", f"{criticas + altas}")
+with col1:
+    st.metric("Batería más crítica", str(peor["BATERIA"]))
 
-with c5:
-    st.metric("Baterías medias", f"{medias}")
+with col2:
+    st.metric("Nivel", str(peor["NIVEL"]))
+
+with col3:
+    st.metric("Promedio actual", f"{peor['PROM_ACTUAL']:,.2f}")
+
+with col4:
+    st.metric("Caída vs previo", f"{peor['CAIDA_ABS']:,.2f}", f"{peor['CAIDA_PCT']:,.2f}%")
+
+with col5:
+    st.metric("Score criticidad", f"{peor['SCORE_CRITICIDAD']:,.2f}")
+
+st.warning(
+    f"Según el criterio de criticidad, la batería más comprometida es {peor['BATERIA']}. "
+    f"Su promedio actual es {peor['PROM_ACTUAL']:.2f}, contra {peor['PROM_PREVIO']:.2f} del periodo previo. "
+    f"La variación es {peor['CAIDA_ABS']:.2f}, equivalente a {peor['CAIDA_PCT']:.2f}%."
+)
 
 st.caption(
-    f"Periodo actual: {periodos['actual_ini'].date()} al {periodos['actual_fin'].date()} | "
-    f"Periodo previo: {periodos['previo_ini'].date()} al {periodos['previo_fin'].date()}"
+    f"Periodo actual evaluado: {periodos['actual_ini'].date()} al {periodos['actual_fin'].date()}. "
+    f"Periodo previo comparado: {periodos['previo_ini'].date()} al {periodos['previo_fin'].date()}."
 )
 
 st.divider()
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Criticidad por batería",
-    "Tendencia diaria",
-    "Top caídas",
-    "Validación de datos"
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Ranking crítico",
+    "Detalle por batería",
+    "Promedio mensual del lote",
+    "Caídas fuertes",
+    "Validación"
 ])
 
-with tab1:
-    st.subheader("Ranking de criticidad")
 
-    columnas_mostrar = [
+# ============================================================
+# TAB 1
+# ============================================================
+
+with tab1:
+    st.subheader("Ranking de baterías críticas")
+
+    columnas_ranking = [
         "NIVEL",
         "BATERIA",
         "PROM_ACTUAL",
         "PROM_PREVIO",
         "CAIDA_ABS",
-        "CAIDA_%",
+        "CAIDA_PCT",
         "PROM_ULT_7D",
         "PROM_7D_PREVIO",
         "CAIDA_ABS_7D",
-        "CAIDA_%_7D",
+        "CAIDA_PCT_7D",
         "PROM_MISMO_PERIODO_AÑO_ANT",
         "CAIDA_ABS_YOY",
-        "CAIDA_%_YOY",
+        "CAIDA_PCT_YOY",
         "ULTIMO_DIA",
-        "VAR_%_ULTIMO_VS_PROM",
+        "VAR_PCT_ULTIMO_VS_PROM",
         "SCORE_CRITICIDAD"
     ]
 
     st.dataframe(
-        formatear_tabla(tabla[columnas_mostrar]),
+        formatear_tabla(resumen[columnas_ranking]),
         use_container_width=True,
         hide_index=True
     )
 
     st.download_button(
-        "Descargar ranking de criticidad",
-        data=descargar_csv(formatear_tabla(tabla[columnas_mostrar])),
+        "Descargar ranking crítico",
+        data=descargar_csv(formatear_tabla(resumen[columnas_ranking])),
         file_name="ranking_criticidad_gas_baterias.csv",
         mime="text/csv"
     )
 
-    peor = resumen.iloc[0]
-    st.warning(
-        f"La batería más crítica según el score es {peor['BATERIA']}. "
-        f"Promedio actual: {peor['PROM_ACTUAL']:.2f}; "
-        f"promedio previo: {peor['PROM_PREVIO']:.2f}; "
-        f"variación: {peor['CAIDA_ABS']:.2f} ({peor['CAIDA_%']:.2f}%)."
-    )
+    st.subheader("Top 10 por caída porcentual del periodo")
+    top_pct = resumen[resumen["CAIDA_PCT"] < 0].sort_values("CAIDA_PCT", ascending=True).head(10)
+    st.bar_chart(top_pct.set_index("BATERIA")["CAIDA_PCT"])
+
+    st.subheader("Top 10 por caída absoluta del periodo")
+    top_abs = resumen[resumen["CAIDA_ABS"] < 0].sort_values("CAIDA_ABS", ascending=True).head(10)
+    st.bar_chart(top_abs.set_index("BATERIA")["CAIDA_ABS"])
+
+
+# ============================================================
+# TAB 2
+# ============================================================
 
 with tab2:
-    st.subheader("Tendencia diaria de gas")
+    st.subheader(f"Detalle mensual de la batería {bateria_sel}")
 
-    baterias_seleccionadas = st.multiselect(
-        "Selecciona baterías",
-        options=baterias,
-        default=list(resumen.head(5)["BATERIA"])
-    )
+    if mensual_bateria.empty:
+        st.info("No hay datos mensuales para la batería y año seleccionados.")
+    else:
+        st.altair_chart(
+            grafica_mensual_bateria(mensual_bateria, metrica_mensual),
+            use_container_width=True
+        )
 
-    fecha_ini_graf = st.date_input(
-        "Fecha inicial del gráfico",
-        value=max(fecha_min, (pd.to_datetime(fecha_corte) - pd.Timedelta(days=180)).date()),
-        min_value=fecha_min,
-        max_value=fecha_max
-    )
+        caidas_bat = mensual_bateria[mensual_bateria["CAIDA_MENSUAL_ABS"] < 0].copy()
+        caidas_bat = caidas_bat.sort_values(["CAIDA_MENSUAL_PCT", "CAIDA_MENSUAL_ABS"], ascending=[True, True])
 
-    graf = df[(df["Fecha"] >= pd.to_datetime(fecha_ini_graf)) & (df["Fecha"] <= pd.to_datetime(fecha_corte))].copy()
+        col_a, col_b = st.columns(2)
 
-    if baterias_seleccionadas:
-        graf_linea = graf.set_index("Fecha")[baterias_seleccionadas]
-        st.line_chart(graf_linea)
+        with col_a:
+            st.write("Tabla mensual")
+            cols_mes = [
+                "MES_LABEL",
+                "PROM_MENSUAL",
+                "TOTAL_MENSUAL",
+                "DIAS_CON_DATO",
+                "CAIDA_MENSUAL_ABS",
+                "CAIDA_MENSUAL_PCT",
+                "ALERTA_CAIDA"
+            ]
+            st.dataframe(
+                formatear_tabla(mensual_bateria[cols_mes]),
+                use_container_width=True,
+                hide_index=True
+            )
 
-        st.write("Promedio móvil de 7 días")
-        st.line_chart(graf_linea.rolling(7).mean())
+        with col_b:
+            st.write("Caídas más fuertes de esta batería")
+            cols_caidas = [
+                "MES_LABEL",
+                "PROM_MENSUAL",
+                "TOTAL_MENSUAL",
+                "CAIDA_MENSUAL_ABS",
+                "CAIDA_MENSUAL_PCT",
+                "ALERTA_CAIDA"
+            ]
+            st.dataframe(
+                formatear_tabla(caidas_bat[cols_caidas].head(10)),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        ultimos_dias = df[["Fecha", bateria_sel]].dropna().copy()
+        ultimos_dias = ultimos_dias[ultimos_dias["Fecha"].dt.year == anio_sel].copy()
+        ultimos_dias = ultimos_dias.rename(columns={bateria_sel: "GAS"})
+        ultimos_dias = ultimos_dias.set_index("Fecha")
+
+        st.subheader(f"Tendencia diaria de {bateria_sel}")
+        st.line_chart(ultimos_dias["GAS"])
+
+        st.subheader(f"Promedio móvil de 7 días de {bateria_sel}")
+        st.line_chart(ultimos_dias["GAS"].rolling(7).mean())
+
+
+# ============================================================
+# TAB 3
+# ============================================================
 
 with tab3:
-    st.subheader("Top caídas")
+    st.subheader(f"Promedio mensual del lote en {anio_sel}")
 
-    col1, col2 = st.columns(2)
+    if mensual_lote.empty:
+        st.info("No hay datos del lote para el año seleccionado.")
+    else:
+        st.altair_chart(
+            grafica_lote_mensual(mensual_lote),
+            use_container_width=True
+        )
 
-    with col1:
-        st.write("Mayor caída absoluta")
-        top_abs = resumen.sort_values("CAIDA_ABS", ascending=True).head(10)
+        st.write("Tabla mensual del lote")
+        cols_lote = [
+            "MES_LABEL",
+            "PROMEDIO_DIARIO_LOTE",
+            "TOTAL_MENSUAL_LOTE",
+            "DIAS_CON_DATO",
+            "VAR_MENSUAL_ABS",
+            "VAR_MENSUAL_PCT"
+        ]
         st.dataframe(
-            formatear_tabla(top_abs[["BATERIA", "PROM_ACTUAL", "PROM_PREVIO", "CAIDA_ABS", "CAIDA_%", "NIVEL"]]),
+            formatear_tabla(mensual_lote[cols_lote]),
             use_container_width=True,
             hide_index=True
         )
-        st.bar_chart(top_abs.set_index("BATERIA")["CAIDA_ABS"])
 
-    with col2:
-        st.write("Mayor caída porcentual")
-        top_pct = resumen.sort_values("CAIDA_%", ascending=True).head(10)
+        ultimo_mes = mensual_lote.iloc[-1]
+        st.info(
+            f"Al último mes disponible en {anio_sel}, el promedio diario del lote es "
+            f"{ultimo_mes['PROMEDIO_DIARIO_LOTE']:.2f}. "
+            f"La variación contra el mes anterior es {ultimo_mes['VAR_MENSUAL_ABS']:.2f}, "
+            f"equivalente a {ultimo_mes['VAR_MENSUAL_PCT']:.2f}%."
+        )
+
+
+# ============================================================
+# TAB 4
+# ============================================================
+
+with tab4:
+    st.subheader(f"Caídas fuertes mensuales en {anio_sel}")
+
+    if caidas_globales.empty:
+        st.info("No se encontraron caídas mensuales para el año seleccionado.")
+    else:
+        top_caidas = caidas_globales.head(20).copy()
+
+        cols_global = [
+            "BATERIA",
+            "MES_LABEL",
+            "PROM_MENSUAL",
+            "TOTAL_MENSUAL",
+            "VALOR_PREVIO",
+            "VALOR",
+            "CAIDA_ABS_MES",
+            "CAIDA_PCT_MES",
+            "DIAS_CON_DATO"
+        ]
+
         st.dataframe(
-            formatear_tabla(top_pct[["BATERIA", "PROM_ACTUAL", "PROM_PREVIO", "CAIDA_ABS", "CAIDA_%", "NIVEL"]]),
+            formatear_tabla(top_caidas[cols_global]),
             use_container_width=True,
             hide_index=True
         )
-        st.bar_chart(top_pct.set_index("BATERIA")["CAIDA_%"])
 
-    st.write("Menor producción promedio actual")
-    menor_prod = resumen.sort_values("PROM_ACTUAL", ascending=True).head(10)
+        st.download_button(
+            "Descargar caídas fuertes mensuales",
+            data=descargar_csv(formatear_tabla(caidas_globales[cols_global])),
+            file_name="caidas_fuertes_mensuales_baterias.csv",
+            mime="text/csv"
+        )
+
+        graf_caidas = top_caidas.copy()
+        graf_caidas["BATERIA_MES"] = graf_caidas["BATERIA"].astype(str) + " " + graf_caidas["MES_LABEL"].astype(str)
+
+        st.subheader("Top 20 caídas porcentuales")
+        st.bar_chart(graf_caidas.set_index("BATERIA_MES")["CAIDA_PCT_MES"])
+
+        st.subheader("Top 20 caídas absolutas")
+        top_abs_mes = caidas_globales.sort_values("CAIDA_ABS_MES", ascending=True).head(20).copy()
+        top_abs_mes["BATERIA_MES"] = top_abs_mes["BATERIA"].astype(str) + " " + top_abs_mes["MES_LABEL"].astype(str)
+        st.bar_chart(top_abs_mes.set_index("BATERIA_MES")["CAIDA_ABS_MES"])
+
+
+# ============================================================
+# TAB 5
+# ============================================================
+
+with tab5:
+    st.subheader("Validación del archivo cargado")
+
+    st.write(f"Hoja usada: {hoja_usada}")
+    st.write(f"Rango de fechas detectado: {fecha_min} al {fecha_max}")
+    st.write(f"Número de baterías detectadas: {len(baterias)}")
+
+    st.write("Baterías detectadas")
     st.dataframe(
-        formatear_tabla(menor_prod[["BATERIA", "PROM_ACTUAL", "PROM_PREVIO", "CAIDA_ABS", "CAIDA_%", "NIVEL"]]),
+        pd.DataFrame({"BATERIA": baterias}),
         use_container_width=True,
         hide_index=True
     )
 
-with tab4:
-    st.subheader("Validación de datos cargados")
-
-    st.write(f"Hoja usada: {hoja}")
-    st.write(f"Rango de fechas detectado: {fecha_min} al {fecha_max}")
-    st.write(f"Número de baterías detectadas: {len(baterias)}")
-
-    st.write("Baterías detectadas:")
-    st.dataframe(pd.DataFrame({"BATERIA": baterias}), use_container_width=True, hide_index=True)
-
-    st.write("Primeras filas del archivo limpio:")
-    cols_muestra = ["Fecha"] + baterias[:10]
-    st.dataframe(df[cols_muestra].head(20), use_container_width=True, hide_index=True)
+    st.write("Primeras filas leídas")
+    columnas_muestra = ["Fecha"] + baterias[:12]
+    st.dataframe(
+        df[columnas_muestra].head(20),
+        use_container_width=True,
+        hide_index=True
+    )
