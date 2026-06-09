@@ -1,6 +1,6 @@
 import io
 import re
-from datetime import timedelta
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -9,8 +9,8 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="Análisis de caídas por batería y pozo",
-    page_icon="⛽",
+    page_title="Caídas de producción por batería y pozo",
+    page_icon="📉",
     layout="wide"
 )
 
@@ -24,19 +24,41 @@ MESES_ES = {
     7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"
 }
 
-COLUMNAS_BASE = [
-    "Fecha", "Pozo", "Bateria", "Batería", "SubSistema", "SubSist", "TEST_PURP_CD", "T_HRS",
-    "PROD_OIL", "PROD_GAS", "PROD_WAT",
-    "PROD_OIL_REAL", "PROD_GAS_REAL", "PROD_WAT_REAL",
-    "PetroleoPerdido", "GasPerdido", "AguaPerdida",
-    "ProdReal Cierre", "ProdGas Real Cierre", "ProdAgua Real Cierre",
-    "PROD_GAS_POT", "PROD_GAS_POT_REAL"
-]
+PRODUCTOS = {
+    "Gas": {
+        "columnas_preferidas": [
+            "PROD_GAS_REAL",
+            "ProdGas Real Cierre",
+            "PROD_GAS",
+            "PROD_GAS_POT_REAL",
+            "PROD_GAS_POT"
+        ],
+        "columna_perdida": "GasPerdido",
+        "unidad": "MPCD"
+    },
+    "Petróleo": {
+        "columnas_preferidas": [
+            "PROD_OIL_REAL",
+            "ProdReal Cierre",
+            "PROD_OIL"
+        ],
+        "columna_perdida": "PetroleoPerdido",
+        "unidad": "BOPD"
+    }
+}
 
 
 # ============================================================
-# FUNCIONES DE LIMPIEZA Y DETECCIÓN
+# UTILIDADES
 # ============================================================
+
+def normalizar_texto(valor):
+    if pd.isna(valor):
+        return ""
+    texto = str(valor).strip()
+    texto = re.sub(r"\s+", " ", texto)
+    return texto
+
 
 def normalizar_columna(columna):
     texto = str(columna).strip()
@@ -46,97 +68,49 @@ def normalizar_columna(columna):
 
 def clave_columna(columna):
     texto = normalizar_columna(columna).lower()
-    reemplazos = {
-        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ñ": "n"
-    }
-    for origen, destino in reemplazos.items():
-        texto = texto.replace(origen, destino)
-    texto = re.sub(r"[^a-z0-9]", "", texto)
+    texto = texto.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+    texto = re.sub(r"[^a-z0-9]+", "_", texto)
+    texto = texto.strip("_")
     return texto
 
 
-def detectar_fila_header(excel_bytes):
-    vista = pd.read_excel(
-        io.BytesIO(excel_bytes),
-        header=None,
-        nrows=12,
-        engine="openpyxl"
-    )
+def buscar_columna(df, posibles):
+    mapa = {clave_columna(c): c for c in df.columns}
+    for posible in posibles:
+        key = clave_columna(posible)
+        if key in mapa:
+            return mapa[key]
+    return None
 
-    for idx, fila in vista.iterrows():
-        valores = [clave_columna(x) for x in fila.tolist()]
-        tiene_fecha = "fecha" in valores
-        tiene_pozo = "pozo" in valores
-        tiene_bateria = "bateria" in valores
 
-        if tiene_fecha and tiene_pozo and tiene_bateria:
+def detectar_fila_header(file_bytes, sheet_name=0):
+    preview = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=20)
+
+    obligatorias = {"fecha", "pozo", "bateria"}
+    for idx in range(len(preview)):
+        valores = {clave_columna(x) for x in preview.iloc[idx].tolist() if pd.notna(x)}
+        if obligatorias.issubset(valores):
             return idx
 
     return 0
 
 
-def resolver_columna(df, candidatos):
-    mapa = {clave_columna(c): c for c in df.columns}
-    for candidato in candidatos:
-        clave = clave_columna(candidato)
-        if clave in mapa:
-            return mapa[clave]
-    return None
-
-
-def convertir_fecha(serie):
-    fecha = pd.to_datetime(serie, errors="coerce")
-
-    if fecha.notna().mean() < 0.60:
-        numeros = pd.to_numeric(serie, errors="coerce")
-        fecha_excel = pd.to_datetime(
-            numeros,
-            unit="D",
-            origin="1899-12-30",
-            errors="coerce"
-        )
-        if fecha_excel.notna().sum() > fecha.notna().sum():
-            fecha = fecha_excel
-
-    return fecha
-
-
 @st.cache_data(show_spinner=False)
-def cargar_excel(excel_bytes):
-    fila_header = detectar_fila_header(excel_bytes)
+def cargar_excel(file_bytes):
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    hoja = xls.sheet_names[0]
+    header_row = detectar_fila_header(file_bytes, sheet_name=hoja)
 
-    columnas = pd.read_excel(
-        io.BytesIO(excel_bytes),
-        header=fila_header,
-        nrows=0,
-        engine="openpyxl"
-    ).columns.tolist()
-
-    claves_necesarias = {clave_columna(c) for c in COLUMNAS_BASE}
-    usecols = []
-
-    for col in columnas:
-        if clave_columna(col) in claves_necesarias:
-            usecols.append(col)
-
-    if not usecols:
-        raise ValueError("No se detectaron columnas útiles. Revisa que el archivo tenga Fecha, Pozo y Bateria.")
-
-    df = pd.read_excel(
-        io.BytesIO(excel_bytes),
-        header=fila_header,
-        usecols=usecols,
-        engine="openpyxl"
-    )
-
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=hoja, header=header_row)
     df.columns = [normalizar_columna(c) for c in df.columns]
+    df = df.dropna(how="all").copy()
 
-    col_fecha = resolver_columna(df, ["Fecha"])
-    col_pozo = resolver_columna(df, ["Pozo"])
-    col_bateria = resolver_columna(df, ["Bateria", "Batería"])
+    col_fecha = buscar_columna(df, ["Fecha", "FECHA", "date"])
+    col_pozo = buscar_columna(df, ["Pozo", "POZO", "well"])
+    col_bateria = buscar_columna(df, ["Bateria", "Batería", "BAT", "battery"])
 
     if col_fecha is None or col_pozo is None or col_bateria is None:
-        raise ValueError("Faltan columnas base. El Excel debe tener Fecha, Pozo y Bateria.")
+        raise ValueError("No encontré las columnas obligatorias Fecha, Pozo y Bateria.")
 
     df = df.rename(columns={
         col_fecha: "Fecha",
@@ -144,259 +118,224 @@ def cargar_excel(excel_bytes):
         col_bateria: "Bateria"
     })
 
-    df["Fecha"] = convertir_fecha(df["Fecha"])
-    df["Pozo"] = df["Pozo"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-    df["Bateria"] = df["Bateria"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
     df = df[df["Fecha"].notna()].copy()
+    df["Fecha"] = df["Fecha"].dt.normalize()
+
+    df["Pozo"] = df["Pozo"].apply(normalizar_texto)
+    df["Bateria"] = df["Bateria"].apply(normalizar_texto)
     df = df[(df["Pozo"] != "") & (df["Bateria"] != "")].copy()
-    df = df[~df["Pozo"].str.lower().isin(["nan", "none"])]
-    df = df[~df["Bateria"].str.lower().isin(["nan", "none"])]
 
     for col in df.columns:
         if col not in ["Fecha", "Pozo", "Bateria", "SubSistema", "SubSist", "TEST_PURP_CD"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            convertido = pd.to_numeric(df[col], errors="coerce")
+            if convertido.notna().sum() > 0:
+                df[col] = convertido
 
-    df = df.sort_values("Fecha").reset_index(drop=True)
-
-    return df, fila_header + 1
+    return df, hoja, header_row + 1
 
 
-def columnas_por_producto(df, producto):
-    if producto == "Gas":
-        produccion = [
-            "PROD_GAS_REAL",
-            "ProdGas Real Cierre",
-            "PROD_GAS",
-            "PROD_GAS_POT_REAL",
-            "PROD_GAS_POT"
-        ]
-        perdida = ["GasPerdido"]
-        unidad = "MSCFD o unidad de gas del archivo"
+def columnas_disponibles_producto(df, producto):
+    preferidas = PRODUCTOS[producto]["columnas_preferidas"]
+    disponibles = []
+
+    for col in preferidas:
+        real = buscar_columna(df, [col])
+        if real is not None and real not in disponibles:
+            disponibles.append(real)
+
+    # Respaldo: si el nombre tiene GAS u OIL y es numérico, lo agrega.
+    palabra = "gas" if producto == "Gas" else "oil"
+    for col in df.columns:
+        if palabra in clave_columna(col) and pd.api.types.is_numeric_dtype(df[col]):
+            if col not in disponibles:
+                disponibles.append(col)
+
+    return disponibles
+
+
+def obtener_columna_perdida(df, producto):
+    perdida = PRODUCTOS[producto]["columna_perdida"]
+    return buscar_columna(df, [perdida])
+
+
+def aplicar_filtros(df, fecha_ini, fecha_fin, baterias_sel, texto_pozo):
+    salida = df[(df["Fecha"] >= pd.to_datetime(fecha_ini)) & (df["Fecha"] <= pd.to_datetime(fecha_fin))].copy()
+
+    if baterias_sel:
+        salida = salida[salida["Bateria"].isin(baterias_sel)].copy()
+
+    texto_pozo = normalizar_texto(texto_pozo)
+    if texto_pozo:
+        salida = salida[salida["Pozo"].str.contains(texto_pozo, case=False, na=False, regex=False)].copy()
+
+    return salida
+
+
+def lista_fechas(fecha_ini, fecha_fin):
+    return pd.date_range(pd.to_datetime(fecha_ini), pd.to_datetime(fecha_fin), freq="D")
+
+
+def diario_lote(df, col_valor, fechas):
+    diario = df.groupby("Fecha", as_index=False)[col_valor].sum()
+    diario = diario.set_index("Fecha").reindex(fechas, fill_value=0).rename_axis("Fecha").reset_index()
+    diario = diario.rename(columns={col_valor: "PRODUCCION"})
+    diario["PROM_MOVIL_7D"] = diario["PRODUCCION"].rolling(7, min_periods=1).mean()
+    return diario
+
+
+def promedio_periodo_diario(df, col_valor, fechas):
+    if len(fechas) == 0:
+        return 0.0
+    diario = diario_lote(df, col_valor, fechas)
+    return float(diario["PRODUCCION"].mean())
+
+
+def calcular_ranking_caida(df, grupo_cols: List[str], col_valor: str, col_perdida: str, fecha_ini, fecha_fin, n_dias: int, min_prom_inicial: float):
+    fecha_ini = pd.to_datetime(fecha_ini)
+    fecha_fin = pd.to_datetime(fecha_fin)
+
+    fechas_rango = lista_fechas(fecha_ini, fecha_fin)
+    if len(fechas_rango) == 0:
+        return pd.DataFrame(), None
+
+    n_dias = int(max(1, min(n_dias, len(fechas_rango))))
+    fechas_inicio = fechas_rango[:n_dias]
+    fechas_final = fechas_rango[-n_dias:]
+
+    grupos = df[grupo_cols].drop_duplicates().copy()
+    if grupos.empty:
+        return pd.DataFrame(), {
+            "inicio_ini": fechas_inicio.min(), "inicio_fin": fechas_inicio.max(),
+            "final_ini": fechas_final.min(), "final_fin": fechas_final.max(),
+            "n_dias": n_dias
+        }
+
+    def promedio_por_grupo(fechas):
+        tmp = df[df["Fecha"].isin(fechas)].copy()
+        diario = tmp.groupby(grupo_cols + ["Fecha"], as_index=False)[col_valor].sum()
+
+        base = grupos.assign(_key=1).merge(
+            pd.DataFrame({"Fecha": fechas, "_key": 1}),
+            on="_key"
+        ).drop(columns="_key")
+
+        diario = base.merge(diario, on=grupo_cols + ["Fecha"], how="left")
+        diario[col_valor] = diario[col_valor].fillna(0)
+
+        prom = diario.groupby(grupo_cols, as_index=False).agg(
+            PROMEDIO=(col_valor, "mean"),
+            TOTAL=(col_valor, "sum"),
+            DIAS_EVALUADOS=("Fecha", "count")
+        )
+        return prom
+
+    inicio = promedio_por_grupo(fechas_inicio).rename(columns={
+        "PROMEDIO": "PROM_INICIAL",
+        "TOTAL": "TOTAL_INICIAL",
+        "DIAS_EVALUADOS": "DIAS_INICIO"
+    })
+
+    final = promedio_por_grupo(fechas_final).rename(columns={
+        "PROMEDIO": "PROM_FINAL",
+        "TOTAL": "TOTAL_FINAL",
+        "DIAS_EVALUADOS": "DIAS_FINAL"
+    })
+
+    ranking = inicio.merge(final, on=grupo_cols, how="outer").fillna(0)
+
+    ranking["PERDIDA_PROM_DIARIA"] = ranking["PROM_INICIAL"] - ranking["PROM_FINAL"]
+    ranking["CAIDA_PCT"] = np.where(
+        ranking["PROM_INICIAL"] > 0,
+        ranking["PERDIDA_PROM_DIARIA"] / ranking["PROM_INICIAL"] * 100,
+        np.nan
+    )
+
+    ranking["PERDIDA_TOTAL_ESTIMADA_RANGO"] = ranking["PERDIDA_PROM_DIARIA"] * len(fechas_rango)
+    ranking["ESTADO_CAIDA"] = np.select(
+        [
+            (ranking["PROM_INICIAL"] > 0) & (ranking["PROM_FINAL"] <= 0),
+            (ranking["CAIDA_PCT"] >= 50),
+            (ranking["CAIDA_PCT"] >= 25),
+            (ranking["CAIDA_PCT"] > 0),
+        ],
+        ["DEJO DE PRODUCIR", "CAIDA CRITICA", "CAIDA ALTA", "CAIDA"],
+        default="SIN CAIDA"
+    )
+
+    if col_perdida and col_perdida in df.columns:
+        perdidas = df.groupby(grupo_cols, as_index=False)[col_perdida].sum().rename(columns={col_perdida: "PERDIDA_REGISTRADA"})
+        ranking = ranking.merge(perdidas, on=grupo_cols, how="left")
+        ranking["PERDIDA_REGISTRADA"] = ranking["PERDIDA_REGISTRADA"].fillna(0)
     else:
-        produccion = [
-            "PROD_OIL_REAL",
-            "ProdReal Cierre",
-            "PROD_OIL"
-        ]
-        perdida = ["PetroleoPerdido"]
-        unidad = "BOPD o unidad de petróleo del archivo"
+        ranking["PERDIDA_REGISTRADA"] = 0.0
 
-    cols_prod = []
-    for candidato in produccion:
-        col = resolver_columna(df, [candidato])
-        if col is not None and col not in cols_prod:
-            cols_prod.append(col)
+    ranking = ranking[ranking["PROM_INICIAL"] >= float(min_prom_inicial)].copy()
+    ranking = ranking[ranking["PERDIDA_PROM_DIARIA"] > 0].copy()
+    ranking = ranking.sort_values(
+        ["PERDIDA_PROM_DIARIA", "CAIDA_PCT", "PERDIDA_REGISTRADA"],
+        ascending=[False, False, False]
+    ).reset_index(drop=True)
 
-    col_perdida = resolver_columna(df, perdida)
-
-    return cols_prod, col_perdida, unidad
-
-
-# ============================================================
-# FUNCIONES DE CÁLCULO
-# ============================================================
-
-def validar_rango(rango):
-    if isinstance(rango, tuple) and len(rango) == 2:
-        return pd.to_datetime(rango[0]), pd.to_datetime(rango[1])
-    return None, None
-
-
-def resumen_lote(df, valor_col, fecha_ini, fecha_fin):
-    dias = max((fecha_fin - fecha_ini).days + 1, 1)
-    previo_fin = fecha_ini - timedelta(days=1)
-    previo_ini = previo_fin - timedelta(days=dias - 1)
-
-    actual = df[(df["Fecha"] >= fecha_ini) & (df["Fecha"] <= fecha_fin)]
-    previo = df[(df["Fecha"] >= previo_ini) & (df["Fecha"] <= previo_fin)]
-
-    suma_actual = actual[valor_col].sum(skipna=True)
-    suma_previa = previo[valor_col].sum(skipna=True)
-    prom_actual = suma_actual / dias
-    prom_previo = suma_previa / dias
-    caida_abs = prom_actual - prom_previo
-    caida_pct = caida_abs / prom_previo * 100 if prom_previo > 0 else np.nan
-
-    return {
-        "dias": dias,
-        "previo_ini": previo_ini,
-        "previo_fin": previo_fin,
-        "suma_actual": suma_actual,
-        "suma_previa": suma_previa,
-        "prom_actual": prom_actual,
-        "prom_previo": prom_previo,
-        "caida_abs": caida_abs,
-        "caida_pct": caida_pct
+    periodos = {
+        "inicio_ini": fechas_inicio.min(),
+        "inicio_fin": fechas_inicio.max(),
+        "final_ini": fechas_final.min(),
+        "final_fin": fechas_final.max(),
+        "n_dias": n_dias,
+        "dias_rango": len(fechas_rango)
     }
 
-
-def comparar_periodo_previo(df, group_cols, valor_col, fecha_ini, fecha_fin, min_prom_previo=0.0):
-    dias = max((fecha_fin - fecha_ini).days + 1, 1)
-    previo_fin = fecha_ini - timedelta(days=1)
-    previo_ini = previo_fin - timedelta(days=dias - 1)
-
-    actual = df[(df["Fecha"] >= fecha_ini) & (df["Fecha"] <= fecha_fin)].copy()
-    previo = df[(df["Fecha"] >= previo_ini) & (df["Fecha"] <= previo_fin)].copy()
-
-    if actual.empty and previo.empty:
-        return pd.DataFrame(), previo_ini, previo_fin
-
-    agg_actual = (
-        actual
-        .groupby(group_cols, dropna=False)
-        .agg(
-            SUM_ACTUAL=(valor_col, "sum"),
-            DIAS_CON_DATO_ACTUAL=("Fecha", "nunique"),
-            MAX_DIA_ACTUAL=(valor_col, "max"),
-            MIN_DIA_ACTUAL=(valor_col, "min")
-        )
-        .reset_index()
-    )
-
-    agg_previo = (
-        previo
-        .groupby(group_cols, dropna=False)
-        .agg(
-            SUM_PREVIO=(valor_col, "sum"),
-            DIAS_CON_DATO_PREVIO=("Fecha", "nunique")
-        )
-        .reset_index()
-    )
-
-    resumen = agg_actual.merge(agg_previo, on=group_cols, how="outer")
-
-    for col in ["SUM_ACTUAL", "SUM_PREVIO", "DIAS_CON_DATO_ACTUAL", "DIAS_CON_DATO_PREVIO", "MAX_DIA_ACTUAL", "MIN_DIA_ACTUAL"]:
-        if col in resumen.columns:
-            resumen[col] = resumen[col].fillna(0)
-
-    resumen["PROM_ACTUAL"] = resumen["SUM_ACTUAL"] / dias
-    resumen["PROM_PREVIO"] = resumen["SUM_PREVIO"] / dias
-    resumen["CAIDA_ABS"] = resumen["PROM_ACTUAL"] - resumen["PROM_PREVIO"]
-    resumen["CAIDA_PCT"] = np.where(
-        resumen["PROM_PREVIO"] > 0,
-        resumen["CAIDA_ABS"] / resumen["PROM_PREVIO"] * 100,
-        np.nan
-    )
-    resumen["PERDIDA_PROM_DIARIA"] = np.where(resumen["CAIDA_ABS"] < 0, -resumen["CAIDA_ABS"], 0)
-    resumen["PERDIDA_PCT"] = np.where(resumen["CAIDA_PCT"] < 0, -resumen["CAIDA_PCT"], 0)
-
-    condiciones = [
-        (resumen["CAIDA_PCT"] <= -25) | (resumen["PERDIDA_PROM_DIARIA"] >= resumen["PERDIDA_PROM_DIARIA"].quantile(0.90)),
-        (resumen["CAIDA_PCT"] <= -15),
-        (resumen["CAIDA_PCT"] <= -5)
-    ]
-    valores = ["CRITICO", "ALTO", "MEDIO"]
-    resumen["NIVEL"] = np.select(condiciones, valores, default="NORMAL")
-
-    resumen = resumen[resumen["PROM_PREVIO"] >= min_prom_previo].copy()
-    resumen = resumen.sort_values(
-        ["PERDIDA_PROM_DIARIA", "PERDIDA_PCT"],
-        ascending=[False, False]
-    ).reset_index(drop=True)
-
-    return resumen, previo_ini, previo_fin
+    return ranking, periodos
 
 
-def comparar_inicio_fin_rango(df, group_cols, valor_col, fecha_ini, fecha_fin, ventana_dias):
-    dias_rango = max((fecha_fin - fecha_ini).days + 1, 1)
-    ventana = int(min(max(1, ventana_dias), max(1, dias_rango // 2)))
+def calcular_periodo_previo(df_total, col_valor, col_perdida, grupo_cols, fecha_ini, fecha_fin):
+    fecha_ini = pd.to_datetime(fecha_ini)
+    fecha_fin = pd.to_datetime(fecha_fin)
+    dias = (fecha_fin - fecha_ini).days + 1
 
-    ini_inicio = fecha_ini
-    fin_inicio = fecha_ini + timedelta(days=ventana - 1)
-    ini_final = fecha_fin - timedelta(days=ventana - 1)
-    fin_final = fecha_fin
+    previo_fin = fecha_ini - pd.Timedelta(days=1)
+    previo_ini = previo_fin - pd.Timedelta(days=dias - 1)
 
-    inicio = df[(df["Fecha"] >= ini_inicio) & (df["Fecha"] <= fin_inicio)].copy()
-    final = df[(df["Fecha"] >= ini_final) & (df["Fecha"] <= fin_final)].copy()
+    actual = df_total[(df_total["Fecha"] >= fecha_ini) & (df_total["Fecha"] <= fecha_fin)].copy()
+    previo = df_total[(df_total["Fecha"] >= previo_ini) & (df_total["Fecha"] <= previo_fin)].copy()
 
-    if inicio.empty and final.empty:
-        return pd.DataFrame(), ini_inicio, fin_inicio, ini_final, fin_final
+    if previo.empty:
+        return pd.DataFrame(), {"previo_ini": previo_ini, "previo_fin": previo_fin, "hay_previo": False}
 
-    agg_inicio = (
-        inicio
-        .groupby(group_cols, dropna=False)
-        .agg(SUM_INICIO=(valor_col, "sum"), DIAS_INICIO=("Fecha", "nunique"))
-        .reset_index()
-    )
+    def prom(df, nombre):
+        diario = df.groupby(grupo_cols + ["Fecha"], as_index=False)[col_valor].sum()
+        return diario.groupby(grupo_cols, as_index=False)[col_valor].mean().rename(columns={col_valor: nombre})
 
-    agg_final = (
-        final
-        .groupby(group_cols, dropna=False)
-        .agg(SUM_FINAL=(valor_col, "sum"), DIAS_FINAL=("Fecha", "nunique"))
-        .reset_index()
-    )
+    a = prom(actual, "PROM_ACTUAL")
+    p = prom(previo, "PROM_PREVIO")
+    res = a.merge(p, on=grupo_cols, how="outer").fillna(0)
+    res["PERDIDA_PROM_DIARIA"] = res["PROM_PREVIO"] - res["PROM_ACTUAL"]
+    res["CAIDA_PCT"] = np.where(res["PROM_PREVIO"] > 0, res["PERDIDA_PROM_DIARIA"] / res["PROM_PREVIO"] * 100, np.nan)
 
-    resumen = agg_inicio.merge(agg_final, on=group_cols, how="outer")
-    for col in ["SUM_INICIO", "SUM_FINAL", "DIAS_INICIO", "DIAS_FINAL"]:
-        resumen[col] = resumen[col].fillna(0)
+    if col_perdida and col_perdida in actual.columns:
+        perdidas = actual.groupby(grupo_cols, as_index=False)[col_perdida].sum().rename(columns={col_perdida: "PERDIDA_REGISTRADA"})
+        res = res.merge(perdidas, on=grupo_cols, how="left")
+    else:
+        res["PERDIDA_REGISTRADA"] = 0
 
-    resumen["PROM_INICIO"] = resumen["SUM_INICIO"] / ventana
-    resumen["PROM_FINAL"] = resumen["SUM_FINAL"] / ventana
-    resumen["CAIDA_ABS_RANGO"] = resumen["PROM_FINAL"] - resumen["PROM_INICIO"]
-    resumen["CAIDA_PCT_RANGO"] = np.where(
-        resumen["PROM_INICIO"] > 0,
-        resumen["CAIDA_ABS_RANGO"] / resumen["PROM_INICIO"] * 100,
-        np.nan
-    )
-    resumen["PERDIDA_PROM_DIARIA_RANGO"] = np.where(resumen["CAIDA_ABS_RANGO"] < 0, -resumen["CAIDA_ABS_RANGO"], 0)
-    resumen["PERDIDA_PCT_RANGO"] = np.where(resumen["CAIDA_PCT_RANGO"] < 0, -resumen["CAIDA_PCT_RANGO"], 0)
-
-    resumen = resumen.sort_values(
-        ["PERDIDA_PROM_DIARIA_RANGO", "PERDIDA_PCT_RANGO"],
-        ascending=[False, False]
-    ).reset_index(drop=True)
-
-    return resumen, ini_inicio, fin_inicio, ini_final, fin_final
+    res = res[res["PERDIDA_PROM_DIARIA"] > 0].sort_values("PERDIDA_PROM_DIARIA", ascending=False).reset_index(drop=True)
+    return res, {"previo_ini": previo_ini, "previo_fin": previo_fin, "hay_previo": True}
 
 
-def ranking_perdidas_registradas(df, group_cols, perdida_col, valor_col, fecha_ini, fecha_fin):
-    if perdida_col is None or perdida_col not in df.columns:
+def tabla_perdida_registrada(df, grupo_cols, col_perdida):
+    if not col_perdida or col_perdida not in df.columns:
         return pd.DataFrame()
 
-    data = df[(df["Fecha"] >= fecha_ini) & (df["Fecha"] <= fecha_fin)].copy()
-    if data.empty:
-        return pd.DataFrame()
-
-    resumen = (
-        data
-        .groupby(group_cols, dropna=False)
+    salida = (
+        df.groupby(grupo_cols, as_index=False)
         .agg(
-            PRODUCCION_TOTAL=(valor_col, "sum"),
-            PERDIDA_REGISTRADA=(perdida_col, "sum"),
-            DIAS_CON_PERDIDA=(perdida_col, lambda x: (x.fillna(0) > 0).sum()),
-            DIAS_CON_DATO=("Fecha", "nunique")
+            PERDIDA_REGISTRADA=(col_perdida, "sum"),
+            DIAS_CON_PERDIDA=(col_perdida, lambda x: int((pd.to_numeric(x, errors="coerce").fillna(0) > 0).sum()))
         )
-        .reset_index()
     )
-
-    resumen["PERDIDA_SOBRE_PRODUCCION_PCT"] = np.where(
-        resumen["PRODUCCION_TOTAL"] > 0,
-        resumen["PERDIDA_REGISTRADA"] / resumen["PRODUCCION_TOTAL"] * 100,
-        np.nan
-    )
-
-    resumen = resumen.sort_values("PERDIDA_REGISTRADA", ascending=False).reset_index(drop=True)
-    return resumen
-
-
-def serie_diaria(df, group_col, valor_col, fecha_ini, fecha_fin, entidad=None):
-    data = df[(df["Fecha"] >= fecha_ini) & (df["Fecha"] <= fecha_fin)].copy()
-
-    if entidad is not None and group_col in data.columns:
-        data = data[data[group_col] == entidad]
-
-    if data.empty:
-        return pd.DataFrame()
-
-    serie = (
-        data
-        .groupby("Fecha", as_index=False)
-        .agg(PRODUCCION=(valor_col, "sum"))
-        .sort_values("Fecha")
-    )
-    serie["PROM_MOVIL_7D"] = serie["PRODUCCION"].rolling(7, min_periods=1).mean()
-    return serie
+    salida = salida[salida["PERDIDA_REGISTRADA"] > 0].sort_values("PERDIDA_REGISTRADA", ascending=False)
+    return salida.reset_index(drop=True)
 
 
 def formatear_tabla(df):
@@ -409,56 +348,33 @@ def formatear_tabla(df):
     return salida
 
 
-def csv_download(df):
-    return formatear_tabla(df).to_csv(index=False).encode("utf-8-sig")
+def descargar_csv(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
-# ============================================================
-# FUNCIONES DE GRÁFICO
-# ============================================================
-
-def etiqueta_entidad(df, group_cols):
-    if "Pozo" in group_cols and "Bateria" in df.columns:
-        return df["Pozo"].astype(str) + " | " + df["Bateria"].astype(str)
-    return df[group_cols[0]].astype(str)
-
-
-def grafico_top_barras(df, group_cols, valor_col, titulo, etiqueta_x):
+def grafico_barras(df, y_col, x_col, titulo, unidad, top_n=20):
     if df.empty:
         return None
 
-    data = df.head(20).copy()
-    data["ENTIDAD_LABEL"] = etiqueta_entidad(data, group_cols)
-    data = data.sort_values(valor_col, ascending=True)
+    plot_df = df.head(top_n).copy()
+    plot_df = plot_df.sort_values(x_col, ascending=True)
 
     fig = px.bar(
-        data,
-        x=valor_col,
-        y="ENTIDAD_LABEL",
+        plot_df,
+        x=x_col,
+        y=y_col,
         orientation="h",
-        text=valor_col,
+        text=x_col,
         title=titulo,
-        labels={valor_col: etiqueta_x, "ENTIDAD_LABEL": ""},
-        template="plotly_white"
+        hover_data=[c for c in ["PROM_INICIAL", "PROM_FINAL", "CAIDA_PCT", "PERDIDA_REGISTRADA"] if c in plot_df.columns]
     )
     fig.update_traces(texttemplate="%{text:,.2f}", textposition="outside")
-    fig.update_layout(height=520, margin=dict(l=20, r=30, t=70, b=30))
-    return fig
-
-
-def grafico_tendencia(serie, titulo, etiqueta_y):
-    if serie.empty:
-        return None
-
-    fig = px.line(
-        serie,
-        x="Fecha",
-        y=["PRODUCCION", "PROM_MOVIL_7D"],
-        title=titulo,
-        labels={"value": etiqueta_y, "variable": "Serie"},
-        template="plotly_white"
+    fig.update_layout(
+        xaxis_title=f"Pérdida promedio diaria ({unidad})",
+        yaxis_title="",
+        height=max(430, 22 * len(plot_df) + 180),
+        margin=dict(l=20, r=30, t=70, b=40)
     )
-    fig.update_layout(height=430, margin=dict(l=20, r=30, t=70, b=30))
     return fig
 
 
@@ -466,455 +382,350 @@ def grafico_tendencia(serie, titulo, etiqueta_y):
 # INTERFAZ
 # ============================================================
 
-st.title("⛽ Análisis de caídas de producción por batería y pozo")
-st.caption("Diseñado para Excel tipo cierre de producción diario con columnas Fecha, Pozo, Bateria, PROD_GAS y PROD_OIL.")
+st.title("📉 Análisis de caídas de producción por batería y pozo")
+st.caption("El ranking principal compara el promedio de los primeros N días contra el promedio de los últimos N días dentro del rango seleccionado. Así no depende de tener datos del periodo anterior.")
 
-producto = st.radio(
-    "Primero selecciona qué quieres analizar",
-    ["Gas", "Petróleo"],
-    horizontal=True
-)
-
-archivo = st.file_uploader(
-    "Sube el Excel de cierre de producción",
-    type=["xlsx"]
-)
+archivo = st.file_uploader("Sube el Excel cierreprod", type=["xlsx", "xls"])
 
 if archivo is None:
-    st.info("Sube el Excel. Luego podrás elegir rango de fechas, columna de producción y presionar Ejecutar análisis.")
+    st.info("Sube el Excel para iniciar el análisis.")
     st.stop()
 
-excel_bytes = archivo.getvalue()
-
-with st.spinner("Cargando Excel. Solo se leen las columnas necesarias para que no se ponga pesado."):
-    try:
-        df, fila_header_detectada = cargar_excel(excel_bytes)
-    except Exception as e:
-        st.error(f"No pude cargar el Excel: {e}")
-        st.stop()
-
-cols_prod, col_perdida, unidad = columnas_por_producto(df, producto)
-
-if not cols_prod:
-    st.error(f"No encontré columnas de producción para {producto}.")
-    st.write("Columnas detectadas:")
-    st.write(list(df.columns))
+try:
+    df, hoja_usada, fila_header = cargar_excel(archivo.getvalue())
+except Exception as e:
+    st.error(f"No se pudo cargar el Excel: {e}")
     st.stop()
 
 fecha_min = df["Fecha"].min().date()
 fecha_max = df["Fecha"].max().date()
 baterias = sorted(df["Bateria"].dropna().unique().tolist())
 
-with st.container(border=True):
-    c1, c2, c3, c4 = st.columns([1.1, 1.2, 1.2, 1])
+with st.form("formulario_analisis"):
+    st.subheader("1. Selección principal")
+    c1, c2, c3 = st.columns([1, 1.2, 1])
 
     with c1:
-        col_produccion = st.selectbox(
-            "Columna de producción a usar",
-            cols_prod,
-            index=0
-        )
+        producto = st.radio("Producto a analizar", ["Gas", "Petróleo"], horizontal=True)
+
+    columnas_producto = columnas_disponibles_producto(df, producto)
+    if not columnas_producto:
+        st.error(f"No encontré columnas numéricas para {producto}.")
+        st.stop()
+
+    default_col = 0
+    for i, col in enumerate(columnas_producto):
+        if producto == "Gas" and clave_columna(col) == "prod_gas_real":
+            default_col = i
+        if producto == "Petróleo" and clave_columna(col) == "prod_oil_real":
+            default_col = i
 
     with c2:
-        rango_fechas = st.date_input(
-            "Rango de fechas del periodo actual",
+        col_valor = st.selectbox("Columna de producción", columnas_producto, index=default_col)
+
+    with c3:
+        top_n = st.number_input("Top a mostrar", min_value=5, max_value=100, value=20, step=5)
+
+    st.subheader("2. Rango de fechas")
+    c4, c5, c6 = st.columns([1.3, 1, 1])
+
+    with c4:
+        rango = st.date_input(
+            "Rango de fechas del análisis",
             value=(fecha_min, fecha_max),
             min_value=fecha_min,
             max_value=fecha_max
         )
 
-    with c3:
-        baterias_sel = st.multiselect(
-            "Filtrar baterías opcional",
-            baterias,
-            default=[]
+    with c5:
+        n_dias = st.slider(
+            "Comparar primeros N días contra últimos N días",
+            min_value=1,
+            max_value=31,
+            value=7,
+            help="Ejemplo: con 7 compara el promedio de los primeros 7 días contra el promedio de los últimos 7 días del rango seleccionado."
         )
 
-    with c4:
-        min_prom_previo = st.number_input(
-            "Mín. promedio previo",
-            min_value=0.0,
-            value=0.0,
-            step=1.0
-        )
+    with c6:
+        ordenar_info = st.info("El ranking se ordena por mayor pérdida promedio diaria.")
 
-    fecha_ini, fecha_fin = validar_rango(rango_fechas)
+    with st.expander("Filtros opcionales"):
+        f1, f2, f3 = st.columns([1.5, 1, 1])
+        with f1:
+            baterias_sel = st.multiselect(
+                "Filtrar baterías opcional. Si lo dejas vacío, analiza todas.",
+                baterias,
+                default=[]
+            )
+        with f2:
+            texto_pozo = st.text_input("Filtrar pozo por texto opcional", value="")
+        with f3:
+            min_prom_inicial = st.number_input(
+                "Ignorar grupos con promedio inicial menor a",
+                min_value=0.0,
+                value=0.0,
+                step=1.0,
+                help="Sirve para ocultar pozos o baterías con producción inicial muy pequeña. Déjalo en 0 para no filtrar."
+            )
 
-    if fecha_ini is None or fecha_fin is None:
-        st.warning("Selecciona fecha inicial y fecha final.")
-        st.stop()
-
-    dias_rango = max((fecha_fin - fecha_ini).days + 1, 1)
-    ventana_default = int(min(7, max(1, dias_rango // 2)))
-    ventana_max = int(max(1, min(30, dias_rango // 2)))
-
-    ventana_inicio_fin = st.slider(
-        "Para caída dentro del rango, comparar primeros N días contra últimos N días",
-        min_value=1,
-        max_value=ventana_max,
-        value=ventana_default
-    )
-
-    ejecutar = st.button("Ejecutar análisis", type="primary", use_container_width=True)
+    ejecutar = st.form_submit_button("Ejecutar análisis", use_container_width=True)
 
 if not ejecutar:
-    st.info("Ajusta los filtros y presiona Ejecutar análisis.")
+    st.info("Configura producto, fechas y filtros. Luego presiona Ejecutar análisis.")
     st.stop()
 
-if baterias_sel:
-    df_analisis = df[df["Bateria"].isin(baterias_sel)].copy()
+if isinstance(rango, tuple) and len(rango) == 2:
+    fecha_ini, fecha_fin = rango
 else:
-    df_analisis = df.copy()
-
-if df_analisis.empty:
-    st.warning("No hay datos con los filtros seleccionados.")
+    st.error("Selecciona fecha inicial y fecha final.")
     st.stop()
 
-# ============================================================
-# EJECUCIÓN DE CÁLCULOS
-# ============================================================
+if pd.to_datetime(fecha_ini) > pd.to_datetime(fecha_fin):
+    st.error("La fecha inicial no puede ser mayor que la fecha final.")
+    st.stop()
 
-lote = resumen_lote(df_analisis, col_produccion, fecha_ini, fecha_fin)
+col_perdida = obtener_columna_perdida(df, producto)
+unidad = PRODUCTOS[producto]["unidad"]
 
-ranking_bateria, previo_ini, previo_fin = comparar_periodo_previo(
-    df_analisis,
-    ["Bateria"],
-    col_produccion,
-    fecha_ini,
-    fecha_fin,
-    min_prom_previo=min_prom_previo
+df_filtrado = aplicar_filtros(df, fecha_ini, fecha_fin, baterias_sel, texto_pozo)
+df_filtrado[col_valor] = pd.to_numeric(df_filtrado[col_valor], errors="coerce").fillna(0)
+
+if df_filtrado.empty:
+    st.warning("No hay datos para los filtros seleccionados.")
+    st.stop()
+
+fechas_rango = lista_fechas(fecha_ini, fecha_fin)
+diario_total = diario_lote(df_filtrado, col_valor, fechas_rango)
+
+ranking_bateria, periodos = calcular_ranking_caida(
+    df=df_filtrado,
+    grupo_cols=["Bateria"],
+    col_valor=col_valor,
+    col_perdida=col_perdida,
+    fecha_ini=fecha_ini,
+    fecha_fin=fecha_fin,
+    n_dias=n_dias,
+    min_prom_inicial=min_prom_inicial
 )
 
-ranking_pozo, _, _ = comparar_periodo_previo(
-    df_analisis,
-    ["Pozo", "Bateria"],
-    col_produccion,
-    fecha_ini,
-    fecha_fin,
-    min_prom_previo=min_prom_previo
+ranking_pozo, _ = calcular_ranking_caida(
+    df=df_filtrado,
+    grupo_cols=["Bateria", "Pozo"],
+    col_valor=col_valor,
+    col_perdida=col_perdida,
+    fecha_ini=fecha_ini,
+    fecha_fin=fecha_fin,
+    n_dias=n_dias,
+    min_prom_inicial=min_prom_inicial
 )
 
-rango_bateria, ini_inicio, fin_inicio, ini_final, fin_final = comparar_inicio_fin_rango(
-    df_analisis,
-    ["Bateria"],
-    col_produccion,
-    fecha_ini,
-    fecha_fin,
-    ventana_inicio_fin
+perdida_bateria = tabla_perdida_registrada(df_filtrado, ["Bateria"], col_perdida)
+perdida_pozo = tabla_perdida_registrada(df_filtrado, ["Bateria", "Pozo"], col_perdida)
+
+# Comparación contra periodo previo solo como referencia secundaria.
+ranking_bat_previo, info_previo = calcular_periodo_previo(
+    df_total=df,
+    col_valor=col_valor,
+    col_perdida=col_perdida,
+    grupo_cols=["Bateria"],
+    fecha_ini=fecha_ini,
+    fecha_fin=fecha_fin
 )
 
-rango_pozo, _, _, _, _ = comparar_inicio_fin_rango(
-    df_analisis,
-    ["Pozo", "Bateria"],
-    col_produccion,
-    fecha_ini,
-    fecha_fin,
-    ventana_inicio_fin
-)
-
-perdidas_bateria = ranking_perdidas_registradas(
-    df_analisis,
-    ["Bateria"],
-    col_perdida,
-    col_produccion,
-    fecha_ini,
-    fecha_fin
-)
-
-perdidas_pozo = ranking_perdidas_registradas(
-    df_analisis,
-    ["Pozo", "Bateria"],
-    col_perdida,
-    col_produccion,
-    fecha_ini,
-    fecha_fin
-)
-
-peor_bateria = ranking_bateria.iloc[0] if not ranking_bateria.empty else None
-peor_pozo = ranking_pozo.iloc[0] if not ranking_pozo.empty else None
-
-# ============================================================
-# RESUMEN EJECUTIVO
-# ============================================================
+prom_inicial_lote = promedio_periodo_diario(df_filtrado, col_valor, lista_fechas(periodos["inicio_ini"], periodos["inicio_fin"]))
+prom_final_lote = promedio_periodo_diario(df_filtrado, col_valor, lista_fechas(periodos["final_ini"], periodos["final_fin"]))
+perdida_lote = prom_inicial_lote - prom_final_lote
+caida_pct_lote = (perdida_lote / prom_inicial_lote * 100) if prom_inicial_lote > 0 else np.nan
 
 st.subheader("Resumen ejecutivo")
-
-m1, m2, m3, m4, m5 = st.columns(5)
-
-with m1:
+k1, k2, k3, k4, k5 = st.columns(5)
+with k1:
     st.metric("Producto", producto)
-
-with m2:
-    st.metric("Promedio actual lote", f"{lote['prom_actual']:,.2f}")
-
-with m3:
-    st.metric("Promedio previo lote", f"{lote['prom_previo']:,.2f}")
-
-with m4:
-    delta_pct = "" if pd.isna(lote["caida_pct"]) else f"{lote['caida_pct']:,.2f}%"
-    st.metric("Variación lote", f"{lote['caida_abs']:,.2f}", delta_pct)
-
-with m5:
-    st.metric("Días analizados", f"{lote['dias']}")
+with k2:
+    st.metric(f"Promedio inicial lote ({unidad})", f"{prom_inicial_lote:,.2f}")
+with k3:
+    st.metric(f"Promedio final lote ({unidad})", f"{prom_final_lote:,.2f}")
+with k4:
+    st.metric(f"Caída prom. diaria ({unidad})", f"{perdida_lote:,.2f}", f"{caida_pct_lote:,.2f}%" if pd.notna(caida_pct_lote) else None)
+with k5:
+    st.metric("Días del rango", f"{len(fechas_rango)}")
 
 st.info(
-    f"Periodo actual: {fecha_ini.date()} al {fecha_fin.date()}. "
-    f"Periodo previo comparado: {previo_ini.date()} al {previo_fin.date()}. "
-    f"Columna usada: {col_produccion}."
+    f"Se compara el promedio inicial del {periodos['inicio_ini'].date()} al {periodos['inicio_fin'].date()} "
+    f"contra el promedio final del {periodos['final_ini'].date()} al {periodos['final_fin'].date()}. "
+    f"Columna usada: {col_valor}."
 )
 
-if peor_bateria is not None and peor_pozo is not None:
-    st.warning(
-        f"Mayor caída por batería: {peor_bateria['Bateria']} con pérdida promedio diaria de "
-        f"{peor_bateria['PERDIDA_PROM_DIARIA']:,.2f}. "
-        f"Mayor caída por pozo: {peor_pozo['Pozo']} en {peor_pozo['Bateria']} con pérdida promedio diaria de "
-        f"{peor_pozo['PERDIDA_PROM_DIARIA']:,.2f}."
+if ranking_bateria.empty:
+    st.warning("No se detectaron caídas por batería dentro del rango seleccionado. Revisa la columna seleccionada, el rango de fechas o el filtro de producción inicial mínima.")
+else:
+    peor_bat = ranking_bateria.iloc[0]
+    peor_pozo = ranking_pozo.iloc[0] if not ranking_pozo.empty else None
+    mensaje = (
+        f"Mayor caída por batería: {peor_bat['Bateria']} con pérdida promedio diaria de "
+        f"{peor_bat['PERDIDA_PROM_DIARIA']:,.2f} {unidad}, pasando de "
+        f"{peor_bat['PROM_INICIAL']:,.2f} a {peor_bat['PROM_FINAL']:,.2f} {unidad}."
     )
+    if peor_pozo is not None:
+        mensaje += (
+            f" Mayor caída por pozo: {peor_pozo['Pozo']} en {peor_pozo['Bateria']} con pérdida promedio diaria de "
+            f"{peor_pozo['PERDIDA_PROM_DIARIA']:,.2f} {unidad}."
+        )
+    st.warning(mensaje)
 
 st.divider()
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Caída por batería",
     "Caída por pozo",
-    "Dentro del rango",
+    "Tendencia diaria",
     "Pérdida registrada",
     "Detalle batería",
     "Validación"
 ])
 
-
-# ============================================================
-# TAB 1
-# ============================================================
-
 with tab1:
-    st.subheader("Ranking de caída por batería contra periodo previo")
+    st.subheader("Ranking de caída por batería dentro del rango")
+    st.caption("Ordenado de mayor a menor pérdida promedio diaria. Esta es la vista principal para saber dónde cayó más.")
 
-    if ranking_bateria.empty:
-        st.info("No hay ranking de batería con los filtros seleccionados.")
-    else:
-        fig = grafico_top_barras(
-            ranking_bateria,
-            ["Bateria"],
-            "PERDIDA_PROM_DIARIA",
-            f"Top baterías con mayor caída de {producto.lower()}",
-            f"Pérdida promedio diaria de {producto.lower()}"
-        )
+    cols_bat = [
+        "Bateria", "ESTADO_CAIDA", "PROM_INICIAL", "PROM_FINAL",
+        "PERDIDA_PROM_DIARIA", "CAIDA_PCT", "PERDIDA_TOTAL_ESTIMADA_RANGO",
+        "PERDIDA_REGISTRADA", "DIAS_INICIO", "DIAS_FINAL"
+    ]
+
+    st.dataframe(formatear_tabla(ranking_bateria[cols_bat]), use_container_width=True, hide_index=True)
+
+    fig = grafico_barras(
+        ranking_bateria,
+        y_col="Bateria",
+        x_col="PERDIDA_PROM_DIARIA",
+        titulo=f"Top {top_n} baterías con mayor caída de {producto.lower()}",
+        unidad=unidad,
+        top_n=int(top_n)
+    )
+    if fig:
         st.plotly_chart(fig, use_container_width=True)
 
-        cols = [
-            "NIVEL", "Bateria", "PROM_ACTUAL", "PROM_PREVIO", "CAIDA_ABS", "CAIDA_PCT",
-            "PERDIDA_PROM_DIARIA", "PERDIDA_PCT", "SUM_ACTUAL", "SUM_PREVIO",
-            "DIAS_CON_DATO_ACTUAL", "DIAS_CON_DATO_PREVIO"
-        ]
-        st.dataframe(formatear_tabla(ranking_bateria[cols]), use_container_width=True, hide_index=True)
-        st.download_button(
-            "Descargar ranking de baterías",
-            data=csv_download(ranking_bateria[cols]),
-            file_name=f"ranking_caida_baterias_{producto.lower()}.csv",
-            mime="text/csv"
-        )
-
-
-# ============================================================
-# TAB 2
-# ============================================================
-
-with tab2:
-    st.subheader("Ranking de caída por pozo contra periodo previo")
-
-    if ranking_pozo.empty:
-        st.info("No hay ranking de pozo con los filtros seleccionados.")
-    else:
-        fig = grafico_top_barras(
-            ranking_pozo,
-            ["Pozo", "Bateria"],
-            "PERDIDA_PROM_DIARIA",
-            f"Top pozos con mayor caída de {producto.lower()}",
-            f"Pérdida promedio diaria de {producto.lower()}"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        cols = [
-            "NIVEL", "Pozo", "Bateria", "PROM_ACTUAL", "PROM_PREVIO", "CAIDA_ABS", "CAIDA_PCT",
-            "PERDIDA_PROM_DIARIA", "PERDIDA_PCT", "SUM_ACTUAL", "SUM_PREVIO",
-            "DIAS_CON_DATO_ACTUAL", "DIAS_CON_DATO_PREVIO"
-        ]
-        st.dataframe(formatear_tabla(ranking_pozo[cols]), use_container_width=True, hide_index=True)
-        st.download_button(
-            "Descargar ranking de pozos",
-            data=csv_download(ranking_pozo[cols]),
-            file_name=f"ranking_caida_pozos_{producto.lower()}.csv",
-            mime="text/csv"
-        )
-
-
-# ============================================================
-# TAB 3
-# ============================================================
-
-with tab3:
-    st.subheader("Caída dentro del rango seleccionado")
-    st.caption(
-        f"Compara primeros {ventana_inicio_fin} días: {ini_inicio.date()} al {fin_inicio.date()} "
-        f"contra últimos {ventana_inicio_fin} días: {ini_final.date()} al {fin_final.date()}."
+    st.download_button(
+        "Descargar ranking por batería",
+        data=descargar_csv(formatear_tabla(ranking_bateria[cols_bat])),
+        file_name=f"ranking_caida_{producto.lower()}_por_bateria.csv",
+        mime="text/csv"
     )
 
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.write("Baterías")
-        if rango_bateria.empty:
-            st.info("Sin datos.")
-        else:
-            fig = grafico_top_barras(
-                rango_bateria,
-                ["Bateria"],
-                "PERDIDA_PROM_DIARIA_RANGO",
-                f"Caída interna por batería en el rango",
-                "Pérdida promedio diaria"
+    with st.expander("Referencia secundaria: comparación contra periodo previo"):
+        if info_previo["hay_previo"] and not ranking_bat_previo.empty:
+            st.caption(
+                f"Periodo previo usado: {info_previo['previo_ini'].date()} al {info_previo['previo_fin'].date()}. "
+                "Esta vista solo sirve si el Excel tiene datos antes de la fecha inicial seleccionada."
             )
-            st.plotly_chart(fig, use_container_width=True)
-            cols = ["Bateria", "PROM_INICIO", "PROM_FINAL", "CAIDA_ABS_RANGO", "CAIDA_PCT_RANGO", "PERDIDA_PROM_DIARIA_RANGO"]
-            st.dataframe(formatear_tabla(rango_bateria[cols].head(20)), use_container_width=True, hide_index=True)
-
-    with col_b:
-        st.write("Pozos")
-        if rango_pozo.empty:
-            st.info("Sin datos.")
+            st.dataframe(formatear_tabla(ranking_bat_previo.head(50)), use_container_width=True, hide_index=True)
         else:
-            fig = grafico_top_barras(
-                rango_pozo,
-                ["Pozo", "Bateria"],
-                "PERDIDA_PROM_DIARIA_RANGO",
-                f"Caída interna por pozo en el rango",
-                "Pérdida promedio diaria"
+            st.info(
+                f"No hay datos suficientes del periodo previo {info_previo['previo_ini'].date()} al {info_previo['previo_fin'].date()}. "
+                "Por eso antes te salía 0 contra periodo previo. Usa el ranking principal dentro del rango."
             )
+
+with tab2:
+    st.subheader("Ranking de caída por pozo dentro del rango")
+    cols_pozo = [
+        "Bateria", "Pozo", "ESTADO_CAIDA", "PROM_INICIAL", "PROM_FINAL",
+        "PERDIDA_PROM_DIARIA", "CAIDA_PCT", "PERDIDA_TOTAL_ESTIMADA_RANGO",
+        "PERDIDA_REGISTRADA", "DIAS_INICIO", "DIAS_FINAL"
+    ]
+    st.dataframe(formatear_tabla(ranking_pozo[cols_pozo]), use_container_width=True, hide_index=True)
+
+    graf_pozo = ranking_pozo.copy()
+    if not graf_pozo.empty:
+        graf_pozo["Pozo_Bateria"] = graf_pozo["Pozo"].astype(str) + " | " + graf_pozo["Bateria"].astype(str)
+        fig = grafico_barras(
+            graf_pozo,
+            y_col="Pozo_Bateria",
+            x_col="PERDIDA_PROM_DIARIA",
+            titulo=f"Top {top_n} pozos con mayor caída de {producto.lower()}",
+            unidad=unidad,
+            top_n=int(top_n)
+        )
+        if fig:
             st.plotly_chart(fig, use_container_width=True)
-            cols = ["Pozo", "Bateria", "PROM_INICIO", "PROM_FINAL", "CAIDA_ABS_RANGO", "CAIDA_PCT_RANGO", "PERDIDA_PROM_DIARIA_RANGO"]
-            st.dataframe(formatear_tabla(rango_pozo[cols].head(20)), use_container_width=True, hide_index=True)
 
+    st.download_button(
+        "Descargar ranking por pozo",
+        data=descargar_csv(formatear_tabla(ranking_pozo[cols_pozo])),
+        file_name=f"ranking_caida_{producto.lower()}_por_pozo.csv",
+        mime="text/csv"
+    )
 
-# ============================================================
-# TAB 4
-# ============================================================
+with tab3:
+    st.subheader("Tendencia diaria del lote filtrado")
+
+    fig_line = px.line(
+        diario_total,
+        x="Fecha",
+        y=["PRODUCCION", "PROM_MOVIL_7D"],
+        title=f"Producción diaria y promedio móvil de 7 días de {producto.lower()}",
+        labels={"value": unidad, "variable": "Serie"}
+    )
+    fig_line.update_layout(height=480)
+    st.plotly_chart(fig_line, use_container_width=True)
+
+    st.dataframe(formatear_tabla(diario_total), use_container_width=True, hide_index=True)
 
 with tab4:
     st.subheader("Pérdida registrada en el Excel")
-
-    if col_perdida is None:
-        st.info("No se encontró columna de pérdida registrada para este producto.")
+    if col_perdida:
+        st.caption(f"Columna usada: {col_perdida}")
     else:
-        st.caption(f"Columna usada para pérdida registrada: {col_perdida}")
+        st.warning("No se encontró columna de pérdida registrada para este producto.")
 
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            st.write("Por batería")
-            if perdidas_bateria.empty:
-                st.info("No hay pérdida registrada.")
-            else:
-                fig = grafico_top_barras(
-                    perdidas_bateria,
-                    ["Bateria"],
-                    "PERDIDA_REGISTRADA",
-                    f"Top pérdida registrada por batería",
-                    "Pérdida registrada"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                cols = ["Bateria", "PERDIDA_REGISTRADA", "PRODUCCION_TOTAL", "PERDIDA_SOBRE_PRODUCCION_PCT", "DIAS_CON_PERDIDA"]
-                st.dataframe(formatear_tabla(perdidas_bateria[cols].head(30)), use_container_width=True, hide_index=True)
-
-        with col_b:
-            st.write("Por pozo")
-            if perdidas_pozo.empty:
-                st.info("No hay pérdida registrada.")
-            else:
-                fig = grafico_top_barras(
-                    perdidas_pozo,
-                    ["Pozo", "Bateria"],
-                    "PERDIDA_REGISTRADA",
-                    f"Top pérdida registrada por pozo",
-                    "Pérdida registrada"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                cols = ["Pozo", "Bateria", "PERDIDA_REGISTRADA", "PRODUCCION_TOTAL", "PERDIDA_SOBRE_PRODUCCION_PCT", "DIAS_CON_PERDIDA"]
-                st.dataframe(formatear_tabla(perdidas_pozo[cols].head(30)), use_container_width=True, hide_index=True)
-
-
-# ============================================================
-# TAB 5
-# ============================================================
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("Por batería")
+        st.dataframe(formatear_tabla(perdida_bateria.head(50)), use_container_width=True, hide_index=True)
+    with c2:
+        st.write("Por pozo")
+        st.dataframe(formatear_tabla(perdida_pozo.head(50)), use_container_width=True, hide_index=True)
 
 with tab5:
-    st.subheader("Detalle por batería y pozos que explican la caída")
-
+    st.subheader("Detalle por batería")
     if ranking_bateria.empty:
-        st.info("No hay baterías para detallar.")
+        st.info("No hay baterías con caída para detallar.")
     else:
-        lista_bat = ranking_bateria["Bateria"].astype(str).tolist()
-        bateria_detalle = st.selectbox("Selecciona batería", lista_bat)
+        bateria_detalle = st.selectbox("Selecciona batería para ver sus pozos", ranking_bateria["Bateria"].tolist())
+        detalle = ranking_pozo[ranking_pozo["Bateria"] == bateria_detalle].copy()
+        st.dataframe(formatear_tabla(detalle[cols_pozo]), use_container_width=True, hide_index=True)
 
-        df_bat = df_analisis[df_analisis["Bateria"] == bateria_detalle].copy()
-        rank_pozos_bat, _, _ = comparar_periodo_previo(
-            df_bat,
-            ["Pozo"],
-            col_produccion,
-            fecha_ini,
-            fecha_fin,
-            min_prom_previo=min_prom_previo
-        )
-
-        serie_bat = serie_diaria(df_analisis, "Bateria", col_produccion, fecha_ini, fecha_fin, bateria_detalle)
-        fig = grafico_tendencia(
-            serie_bat,
-            f"Tendencia diaria de {producto.lower()} en batería {bateria_detalle}",
-            unidad
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.write("Pozos que más explican la caída de esta batería")
-        if rank_pozos_bat.empty:
-            st.info("Sin pozos con caída calculable para esta batería.")
-        else:
-            fig = grafico_top_barras(
-                rank_pozos_bat,
-                ["Pozo"],
-                "PERDIDA_PROM_DIARIA",
-                f"Pozos con mayor caída en {bateria_detalle}",
-                "Pérdida promedio diaria"
+        graf_detalle = detalle.copy()
+        if not graf_detalle.empty:
+            graf_detalle["Pozo_Bateria"] = graf_detalle["Pozo"].astype(str)
+            fig = grafico_barras(
+                graf_detalle,
+                y_col="Pozo_Bateria",
+                x_col="PERDIDA_PROM_DIARIA",
+                titulo=f"Pozos que explican la caída en {bateria_detalle}",
+                unidad=unidad,
+                top_n=int(top_n)
             )
-            st.plotly_chart(fig, use_container_width=True)
-            cols = [
-                "NIVEL", "Pozo", "PROM_ACTUAL", "PROM_PREVIO", "CAIDA_ABS", "CAIDA_PCT",
-                "PERDIDA_PROM_DIARIA", "SUM_ACTUAL", "SUM_PREVIO", "DIAS_CON_DATO_ACTUAL", "DIAS_CON_DATO_PREVIO"
-            ]
-            st.dataframe(formatear_tabla(rank_pozos_bat[cols]), use_container_width=True, hide_index=True)
-
-
-# ============================================================
-# TAB 6
-# ============================================================
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
 
 with tab6:
-    st.subheader("Validación de carga")
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Filas cargadas", f"{len(df):,}")
-    with c2:
+    st.subheader("Validación del archivo")
+    v1, v2, v3, v4 = st.columns(4)
+    with v1:
+        st.metric("Hoja usada", hoja_usada)
+    with v2:
+        st.metric("Fila de encabezado", fila_header)
+    with v3:
+        st.metric("Filas leídas", f"{len(df):,}")
+    with v4:
         st.metric("Baterías", f"{df['Bateria'].nunique():,}")
-    with c3:
-        st.metric("Pozos", f"{df['Pozo'].nunique():,}")
-    with c4:
-        st.metric("Fila de encabezado", fila_header_detectada)
 
-    st.write(f"Rango de fechas detectado: {fecha_min} al {fecha_max}")
-    st.write(f"Columna de producción seleccionada: {col_produccion}")
-    st.write(f"Columna de pérdida registrada: {col_perdida if col_perdida else 'No encontrada'}")
+    st.write(f"Rango de fechas del archivo: {fecha_min} al {fecha_max}")
+    st.write("Columnas detectadas")
+    st.dataframe(pd.DataFrame({"Columnas": df.columns.tolist()}), use_container_width=True, hide_index=True)
 
-    st.write("Columnas leídas")
-    st.dataframe(pd.DataFrame({"Columna": list(df.columns)}), use_container_width=True, hide_index=True)
-
-    st.write("Muestra de datos")
-    st.dataframe(formatear_tabla(df.head(30)), use_container_width=True, hide_index=True)
+    st.write("Muestra del archivo cargado")
+    muestra_cols = [c for c in ["Fecha", "Pozo", "Bateria", col_valor, col_perdida] if c and c in df.columns]
+    st.dataframe(df[muestra_cols].head(30), use_container_width=True, hide_index=True)
